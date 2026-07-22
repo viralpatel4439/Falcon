@@ -1,0 +1,57 @@
+syntax = "proto3";
+package kv.replication.v1;
+
+service Replication {
+  // Follower requests events from `resume_sequence` onward; leader streams
+  // historical entries first, then transitions to live tailing.
+  rpc StreamChanges(StreamChangesRequest) returns (stream ChangeEventProto);
+
+  // Bulk catch-up / initial full sync for a new or far-behind follower.
+  rpc GetSnapshot(SnapshotRequest) returns (stream SnapshotChunk);
+
+  // Handshake: follower announces itself, leader confirms role + current sequence.
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+}
+
+message StreamChangesRequest {
+  string keyspace = 1;
+  uint64 resume_sequence = 2;
+  string follower_node_id = 3;
+}
+
+message ChangeEventProto {
+  string keyspace = 1;
+  bytes key = 2;
+  oneof value {
+    bytes put_value = 3;
+    bool tombstone = 4;
+  }
+  uint64 sequence = 5;
+  uint64 timestamp_ms = 6;
+  string origin_region = 7;
+  // Hybrid logical clock for multi-region last-write-wins ordering.
+  uint64 hlc_wall = 8;
+  uint32 hlc_logical = 9;
+  string hlc_region = 10;
+}
+
+message SnapshotRequest {
+  string keyspace = 1;
+}
+
+message SnapshotChunk {
+  repeated ChangeEventProto entries = 1;
+  uint64 snapshot_sequence = 2;
+  bool is_final = 3;
+}
+
+message HandshakeRequest {
+  string node_id = 1;
+  string region = 2;
+}
+
+message HandshakeResponse {
+  string leader_node_id = 1;
+  string role = 2;
+  uint64 current_sequence = 3;
+}

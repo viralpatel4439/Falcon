@@ -1,0 +1,146 @@
+//! Durable work queues with at-least-once delivery.
+//!
+//! A queue is a durable append log plus, per consumer group, a cursor and
+//! an in-flight set. `pop` hands the next undelivered message to a consumer
+//! and marks it in-flight with a delivery deadline; `ack` removes it.
+//! Messages whose ack deadline passes are redelivered (at-least-once).
+//! Competing consumers in the SAME group share the stream (work
+//! distribution); different groups each get the full stream independently.
+
+use crate::error::MessagingError;
+use crate::log::{MessageLog, Offset};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+pub struct QueueMessage {
+    pub offset: Offset,
+    pub payload: Vec<u8>,
+}
+
+struct InFlight {
+    deadline: Instant,
+}
+
+struct GroupState {
+    /// Next offset never yet delivered to this group.
+    cursor: Offset,
+    /// Delivered-but-unacked offsets and their redelivery deadlines.
+    in_flight: BTreeMap<Offset, InFlight>,
+}
+
+impl GroupState {
+    fn new() -> Self {
+        Self {
+            cursor: 1,
+            in_flight: BTreeMap::new(),
+        }
+    }
+}
+
+pub struct Queue {
+    name: String,
+    log: MessageLog,
+    ack_timeout: Duration,
+    groups: Mutex<HashMap<String, GroupState>>,
+}
+
+impl Queue {
+    pub fn open(name: &str, data_dir: &Path, ack_timeout: Duration) -> Result<Self, MessagingError> {
+        let path = data_dir.join(format!("queue_{name}.log"));
+        let log = MessageLog::open(&path)?;
+        Ok(Self {
+            name: name.to_string(),
+            log,
+            ack_timeout,
+            groups: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Enqueue a message (durable). Returns its offset.
+    pub fn push(&self, payload: &[u8]) -> Result<Offset, MessagingError> {
+        self.log.append(payload)
+    }
+
+    /// Deliver the next available message to a consumer in `group`.
+    /// Prefers a redelivery (an in-flight message whose ack deadline has
+    /// passed) over a fresh one, so timed-out work is retried promptly.
+    /// Returns `None` if the queue is currently drained for this group.
+    pub fn pop(&self, group: &str) -> Result<Option<QueueMessage>, MessagingError> {
+        let mut groups = self.groups.lock().expect("queue groups mutex poisoned");
+        let state = groups.entry(group.to_string()).or_insert_with(GroupState::new);
+
+        // 1. Redeliver the oldest timed-out in-flight message, if any.
+        let now = Instant::now();
+        let redeliver: Option<Offset> = state
+            .in_flight
+            .iter()
+            .find(|(_, f)| f.deadline <= now)
+            .map(|(&off, _)| off);
+        if let Some(off) = redeliver {
+            state.in_flight.insert(
+                off,
+                InFlight {
+                    deadline: now + self.ack_timeout,
+                },
+            );
+            drop(groups);
+            let msgs = self.log.read_from(off)?;
+            if let Some(m) = msgs.into_iter().find(|m| m.offset == off) {
+                return Ok(Some(QueueMessage {
+                    offset: m.offset,
+                    payload: m.payload,
+                }));
+            }
+            return Ok(None);
+        }
+
+        // 2. Otherwise deliver the next fresh message at/after the cursor.
+        let cursor = state.cursor;
+        drop(groups);
+        let msgs = self.log.read_from(cursor)?;
+        let next = msgs.into_iter().find(|m| m.offset >= cursor);
+        match next {
+            Some(m) => {
+                let mut groups = self.groups.lock().expect("queue groups mutex poisoned");
+                let state = groups.entry(group.to_string()).or_insert_with(GroupState::new);
+                // Advance cursor past this offset and mark it in-flight.
+                state.cursor = m.offset + 1;
+                state.in_flight.insert(
+                    m.offset,
+                    InFlight {
+                        deadline: Instant::now() + self.ack_timeout,
+                    },
+                );
+                Ok(Some(QueueMessage {
+                    offset: m.offset,
+                    payload: m.payload,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Acknowledge a delivered message so it is not redelivered.
+    pub fn ack(&self, group: &str, offset: Offset) {
+        let mut groups = self.groups.lock().expect("queue groups mutex poisoned");
+        if let Some(state) = groups.get_mut(group) {
+            state.in_flight.remove(&offset);
+        }
+    }
+
+    /// Number of in-flight (delivered, unacked) messages for a group.
+    pub fn in_flight_count(&self, group: &str) -> usize {
+        let groups = self.groups.lock().expect("queue groups mutex poisoned");
+        groups.get(group).map(|s| s.in_flight.len()).unwrap_or(0)
+    }
+
+    pub fn depth(&self) -> Offset {
+        self.log.next_offset().saturating_sub(1)
+    }
+}

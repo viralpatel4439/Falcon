@@ -1,0 +1,24 @@
+[package]
+name = "falcon-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+falcon-core = { workspace = true }
+falcon-metrics = { workspace = true }
+falcon-events = { workspace = true }
+falcon-storage = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
+serde_json = { workspace = true }

@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/falcon-events",
+    "crates/falcon-storage",
+    "crates/falcon-proto",
+    "crates/falcon-replication",
+    "crates/falcon-api",
+    "crates/falcon-core",
+    "crates/falcon-cli",
+    "crates/falcon-bench",
+    "crates/falcon-wire",
+    "crates/falcon-messaging",
+    "crates/falcon-metrics",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+anyhow = "1"
+async-trait = "0.1"
+dashmap = "6"
+bytes = "1"
+futures = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+sled = "0.34"
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+tokio-stream = "0.1"
+
+falcon-events = { path = "crates/falcon-events" }
+falcon-storage = { path = "crates/falcon-storage" }
+falcon-proto = { path = "crates/falcon-proto" }
+falcon-replication = { path = "crates/falcon-replication" }
+falcon-api = { path = "crates/falcon-api" }
+falcon-core = { path = "crates/falcon-core" }
+falcon-wire = { path = "crates/falcon-wire" }
+falcon-messaging = { path = "crates/falcon-messaging" }
+falcon-metrics = { path = "crates/falcon-metrics" }
+
+[profile.release]
+lto = true
+codegen-units = 1

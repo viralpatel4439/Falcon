@@ -1,0 +1,199 @@
+use crate::log_reader::ReplicationLogReader;
+use futures::Stream;
+use falcon_events::EventBus;
+use falcon_proto::replication::replication_server::Replication;
+use falcon_proto::replication::{
+    ChangeEventProto, HandshakeRequest, HandshakeResponse, SnapshotChunk, SnapshotRequest,
+    StreamChangesRequest,
+};
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+use tonic::{Request, Response, Status};
+
+/// Per-keyspace replication resources a leader needs to serve followers:
+/// the durable log to read from, and the event bus to wake up a caught-up
+/// follower stream with low latency instead of polling.
+pub struct KeyspaceReplicationSource {
+    pub log_reader: Arc<dyn ReplicationLogReader>,
+    pub events: EventBus,
+}
+
+pub struct ReplicationServerImpl {
+    node_id: String,
+    keyspaces: HashMap<String, KeyspaceReplicationSource>,
+    /// Optional shared-secret token. Empty = auth off (no checks).
+    auth_token: String,
+}
+
+impl ReplicationServerImpl {
+    pub fn new(node_id: String, keyspaces: HashMap<String, KeyspaceReplicationSource>) -> Self {
+        Self {
+            node_id,
+            keyspaces,
+            auth_token: String::new(),
+        }
+    }
+
+    pub fn with_auth_token(mut self, token: String) -> Self {
+        self.auth_token = token;
+        self
+    }
+
+    /// Checks the `authorization` metadata against the configured token.
+    /// A no-op when auth is off. (`Status` is large but that's tonic's type,
+    /// used by every RPC method here — boxing one helper would be inconsistent.)
+    #[allow(clippy::result_large_err)]
+    fn check_auth<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if self.auth_token.is_empty() {
+            return Ok(());
+        }
+        let presented = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        // constant-time-ish compare
+        let (a, b) = (presented.as_bytes(), self.auth_token.as_bytes());
+        let ok = a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0;
+        if ok {
+            Ok(())
+        } else {
+            Err(Status::unauthenticated("invalid or missing replication token"))
+        }
+    }
+}
+
+type ChangeStream = Pin<Box<dyn Stream<Item = Result<ChangeEventProto, Status>> + Send>>;
+type SnapshotStream = Pin<Box<dyn Stream<Item = Result<SnapshotChunk, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl Replication for ReplicationServerImpl {
+    type StreamChangesStream = ChangeStream;
+    type GetSnapshotStream = SnapshotStream;
+
+    async fn handshake(
+        &self,
+        request: Request<HandshakeRequest>,
+    ) -> Result<Response<HandshakeResponse>, Status> {
+        self.check_auth(&request)?;
+        let req = request.into_inner();
+        tracing::info!(follower_node_id = %req.node_id, region = %req.region, "follower handshake");
+        // Single-keyspace-agnostic handshake: current_sequence reported here
+        // is informational; StreamChanges reports the authoritative one per
+        // keyspace since different keyspaces may be at different sequences.
+        let current_sequence = self
+            .keyspaces
+            .values()
+            .map(|src| src.log_reader.current_sequence())
+            .max()
+            .unwrap_or(0);
+        Ok(Response::new(HandshakeResponse {
+            leader_node_id: self.node_id.clone(),
+            role: "leader".to_string(),
+            current_sequence,
+        }))
+    }
+
+    async fn get_snapshot(
+        &self,
+        request: Request<SnapshotRequest>,
+    ) -> Result<Response<Self::GetSnapshotStream>, Status> {
+        self.check_auth(&request)?;
+        let req = request.into_inner();
+        let source = self
+            .keyspaces
+            .get(&req.keyspace)
+            .ok_or_else(|| Status::not_found(format!("unknown keyspace '{}'", req.keyspace)))?;
+
+        let entries = source
+            .log_reader
+            .read_from(0)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let snapshot_sequence = source.log_reader.current_sequence();
+
+        let chunk = SnapshotChunk {
+            entries: entries.iter().map(ChangeEventProto::from).collect(),
+            snapshot_sequence,
+            is_final: true,
+        };
+
+        let stream = tokio_stream::once(Ok(chunk));
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn stream_changes(
+        &self,
+        request: Request<StreamChangesRequest>,
+    ) -> Result<Response<Self::StreamChangesStream>, Status> {
+        self.check_auth(&request)?;
+        let req = request.into_inner();
+        let source = self
+            .keyspaces
+            .get(&req.keyspace)
+            .ok_or_else(|| Status::not_found(format!("unknown keyspace '{}'", req.keyspace)))?;
+
+        tracing::info!(
+            follower_node_id = %req.follower_node_id,
+            keyspace = %req.keyspace,
+            resume_sequence = req.resume_sequence,
+            "follower starting stream"
+        );
+
+        let log_reader = Arc::clone(&source.log_reader);
+        let mut wake = source.events.subscribe();
+        let keyspace = req.keyspace.clone();
+
+        let stream = async_stream::stream! {
+            let mut last_sent = req.resume_sequence;
+
+            // Historical catch-up first.
+            match log_reader.read_from(last_sent) {
+                Ok(events) => {
+                    for event in &events {
+                        last_sent = last_sent.max(event.sequence);
+                        yield Ok(ChangeEventProto::from(event));
+                    }
+                }
+                Err(e) => {
+                    yield Err(Status::internal(e.to_string()));
+                    return;
+                }
+            }
+
+            // Live tail: wake on new local writes, re-read the durable log
+            // from the last sent sequence (handles bursts/coalescing safely).
+            loop {
+                match wake.recv().await {
+                    Ok(_event) => {
+                        match log_reader.read_from(last_sent) {
+                            Ok(events) => {
+                                for event in &events {
+                                    last_sent = last_sent.max(event.sequence);
+                                    yield Ok(ChangeEventProto::from(event));
+                                }
+                            }
+                            Err(e) => {
+                                yield Err(Status::internal(e.to_string()));
+                                return;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Missed wake-up signals; catch up by re-reading the log.
+                        if let Ok(events) = log_reader.read_from(last_sent) {
+                            for event in &events {
+                                last_sent = last_sent.max(event.sequence);
+                                yield Ok(ChangeEventProto::from(event));
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            let _ = keyspace;
+        };
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+}

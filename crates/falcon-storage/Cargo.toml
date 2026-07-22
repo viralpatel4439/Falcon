@@ -1,0 +1,19 @@
+[package]
+name = "falcon-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+falcon-events = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+sled = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
