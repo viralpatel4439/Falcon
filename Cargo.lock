@@ -470,6 +470,7 @@ dependencies = [
  "bytes",
  "falcon-core",
  "falcon-events",
+ "falcon-messaging",
  "falcon-metrics",
  "falcon-storage",
  "futures",

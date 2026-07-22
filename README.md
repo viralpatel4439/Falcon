@@ -22,12 +22,16 @@ is **off by default and costs nothing when unused**.
     to disk (CLOCK eviction), so you can hold far more than RAM and pay RAM only
     for the working set
   - `file-per-key` — each value is an independent file/object (portable,
-    inspectable; the seam for third-party object stores)
-  - `sharded` — keys are **hashed into a fixed set of buckets**, each bucket
-    stored as one object in the backing store, so N buckets = N objects no
-    matter how many keys. The cost-efficient way to sit on a request-billed
-    object store (vs. `file-per-key`'s one-object-per-key billing); O(1) point
-    reads via an in-memory index
+    inspectable; the seam for third-party object stores). **Portability tier,
+    not a hot tier** — one I/O (or one billed request on a remote bucket) *per
+    key*, no in-memory index. For hot/cost-sensitive object storage use
+    `sharded` instead.
+  - `sharded` — **the optimized object-store engine.** Keys are **hashed into a
+    fixed set of buckets**, each bucket stored as one object in the backing
+    store, so *N keys cost a fixed object count* no matter how large N gets.
+    O(1) point reads from an in-memory index; writes coalesce per bucket. This
+    is the cost-efficient, fast way to sit on a request-billed object store —
+    use it instead of `file-per-key` for anything under load.
 - **Pub/Sub topics** — `ephemeral` (fast, at-most-once) or `durable` (persisted,
   replayable, survives restart), selectable per topic
 - **Work queues** — durable, at-least-once, with ack + redelivery-on-timeout and
@@ -87,14 +91,19 @@ in order: defaults < file < env < flags.
 - Set `[storage] data_dir` to any path (local disk, network/mounted volume).
 - Set a keyspace's `tier = "file-per-key"` to store each value as its own file —
   portable and the integration point for third-party object stores (implement the
-  `ObjectStore` trait).
+  `ObjectStore` trait). This is a portability seam, **not** for hot data.
+- Set `tier = "sharded"` (recommended for object storage under load): the same
+  `ObjectStore` seam, but keys hash into a fixed number of buckets so N keys cost
+  a fixed object count, with O(1) in-memory reads. Tune `shard_buckets` /
+  `shard_flush_ms`.
 
 ## Binary protocol (`:6380`)
 
 A length-prefixed TCP protocol with pipelining, for high throughput. Ops: `GET`,
-`SET`, `DEL`, `PING`, `PUBLISH`, `SUBSCRIBE`, `PUSH`, `POP`, `ACK`, `AUTH`. Send
-many requests back-to-back and read replies in order (no per-op round-trip). See
-`crates/falcon-wire/src/protocol.rs` for the frame layout.
+`SET`, `DEL`, `PING`, `PUBLISH`, `SUBSCRIBE`, `PUSH`, `POP`, `ACK`,
+`STREAM_APPEND`, `AUTH`. Send many requests back-to-back and read replies in
+order (no per-op round-trip). See `crates/falcon-wire/src/protocol.rs` for the
+frame layout.
 
 ## Pub/Sub and queues
 
@@ -116,6 +125,49 @@ ack_timeout_secs = 30
   timer; `ACK` confirms it; unacked jobs are redelivered after the timeout.
   Multiple consumers in a group share the work; different groups each get the full
   stream.
+
+## Event streaming (Falcon Event Streaming)
+
+A **stream** is the Kafka-shaped sibling of a topic: **partitioned**, durable,
+replayable, with **per-consumer-group committed offsets**. Records route to a
+partition by key hash (same key ⇒ same partition ⇒ **ordered**); each partition
+is its own durable log; every consumer group keeps a durable offset *per
+partition* and resumes there after a restart (**at-least-once**). Different
+groups each see the full stream independently.
+
+Configure streams (see `config/default.toml`):
+
+```toml
+[[stream]]
+name = "user-events"
+partitions = 8          # ordering domains / parallelism; a key is ordered within its partition
+capacity = 1024         # live-tail broadcast buffer per partition
+```
+
+Drive it over **REST** — append (producer), poll + commit (consumer group):
+
+```bash
+# Append a record; ?key= picks the partition. Returns {partition, offset}.
+curl -X POST 'localhost:8080/streams/user-events/records?key=user:42' -d 'signed_up'
+
+# Poll a partition for a consumer group (records AFTER its committed offset).
+curl 'localhost:8080/streams/user-events/poll?group=analytics&partition=3'
+
+# After processing, durably commit progress (this is the at-least-once boundary).
+curl -X POST 'localhost:8080/streams/user-events/commit?group=analytics&partition=3&offset=57'
+
+# Stream metadata (partition count).
+curl localhost:8080/streams/user-events
+```
+
+The high-throughput **producer path is also on the binary wire protocol**
+(`STREAM_APPEND`, op `0x20`): keyspace = stream name, key = partition key,
+value = payload; the reply carries `partition(4B) + offset(8B)`. Consumer
+poll/commit are request/response and use REST.
+
+**Topic vs. queue vs. stream:** topic = simple fan-out; queue = work
+distribution with acks; **stream = ordered-by-key, replayable, partitioned
+history with independent consumer groups.**
 
 ## Real-time subscriptions (WebSocket)
 
@@ -192,6 +244,51 @@ Example autoscale signals from `/metrics`: `rate(falcon_kv_put_total[1m])`
 docker build -f docker/Dockerfile -t falcon .
 docker run -p 8080:8080 -p 6380:6380 -v falcondata:/data falcon
 docker compose -f docker/docker-compose.yml up   # 2-region cluster
+```
+
+## Benchmarks
+
+Measured with the bundled `falcon-bench` load tester (`--release`, LTO) on a
+development Mac (Apple Silicon, APFS). **These are real numbers from this repo —
+reproduce them with the commands below.** A Linux server with
+power-loss-protected NVMe does materially better on the write path (fsync is the
+bottleneck there).
+
+**Read path — Redis-class.** Reads are served from the in-memory index; the
+binary wire protocol pipelines many ops per round-trip.
+
+| Path | Throughput | p50 | p99 | p99.9 |
+|------|-----------:|----:|----:|------:|
+| Wire GET, pipeline d=128 | **5.6 M ops/sec** | 152 µs | 341 µs | — |
+| Wire GET, pipeline d=16 | 1.85 M ops/sec | 63 µs | 140 µs | — |
+| Wire GET, d=1 (no pipeline) | 176 K ops/sec | 42 µs | 104 µs | — |
+| Sustained read load (64 conns) | **3.0 M ops/sec** | 328 µs | 615 µs | 723 µs |
+| HTTP GET (JSON, 1 req/op) | 61 K ops/sec | 79 µs | 197 µs | — |
+
+**Write path — a durability dial you control.** Every write goes through the
+group-commit WAL. With `fsync`-every-write (the default, *zero acked-write
+loss*) throughput is bound by disk fsync latency; `interval_fsync_ms` trades a
+small bounded loss window for a ~400× throughput jump.
+
+| Write mode | Throughput | p50 | p99 |
+|------------|-----------:|----:|----:|
+| `fsync` every write (max durability) | ~1 K ops/sec | 7 ms | 11 ms |
+| `interval_fsync_ms = 10` (≤10 ms loss window) | **397 K ops/sec** | 1 ms | 5 ms |
+
+**Stability:** every sustained load test reported `STABLE (no latency cliff /
+queue buildup)` — throughput held flat under 64-connection saturation with no
+tail runaway.
+
+Reproduce:
+
+```bash
+cargo build --release -p falcon-cli -p falcon-bench
+# Throughput + latency percentiles (HTTP baseline + pipelined wire):
+./target/release/falcon-bench --pipeline-depths 1,16,128
+# Sustained read load:
+./target/release/falcon-bench --load-test --load-secs 15 --load-conns 64 --load-write-ratio 0.0
+# Write path with interval fsync:
+./target/release/falcon-bench --load-test --load-secs 12 --load-write-ratio 1.0 --load-interval-fsync-ms 10
 ```
 
 ## Safety & durability

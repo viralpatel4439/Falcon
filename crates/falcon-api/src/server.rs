@@ -1,5 +1,6 @@
-use crate::rest::handlers;
+use crate::rest::{handlers, streams};
 use crate::state::AppState;
+use axum::routing::post;
 use crate::ws;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -34,7 +35,12 @@ pub fn router(node: Arc<Node>) -> Router {
             get(handlers::get_key_keyspace)
                 .put(handlers::put_key_keyspace)
                 .delete(handlers::delete_key_keyspace),
-        );
+        )
+        // Falcon Event Streaming: append / poll / commit + metadata.
+        .route("/streams/{stream}", get(streams::info))
+        .route("/streams/{stream}/records", post(streams::append))
+        .route("/streams/{stream}/poll", get(streams::poll))
+        .route("/streams/{stream}/commit", post(streams::commit));
 
     // Anti-OOM: cap request body size so a single huge PUT can't exhaust
     // memory. 0 disables the cap. Applied before handlers run.

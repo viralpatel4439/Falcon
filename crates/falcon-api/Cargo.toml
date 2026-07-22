@@ -9,6 +9,7 @@ falcon-core = { workspace = true }
 falcon-metrics = { workspace = true }
 falcon-events = { workspace = true }
 falcon-storage = { workspace = true }
+falcon-messaging = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

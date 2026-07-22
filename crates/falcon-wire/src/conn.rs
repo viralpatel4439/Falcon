@@ -3,7 +3,7 @@
 use crate::codec::{decode_one, DecodeError};
 use crate::protocol::{
     Request, Response, OP_ACK, OP_AUTH, OP_DEL, OP_GET, OP_PING, OP_POP, OP_PUBLISH, OP_PUSH,
-    OP_SET, OP_SUBSCRIBE,
+    OP_SET, OP_STREAM_APPEND, OP_SUBSCRIBE,
 };
 use bytes::BytesMut;
 use falcon_core::Node;
@@ -122,7 +122,28 @@ async fn dispatch(node: &Node, req: &Request) -> Response {
         OP_PING => Response::Pong,
         OP_GET | OP_SET | OP_DEL => dispatch_kv(node, req).await,
         OP_PUBLISH | OP_PUSH | OP_POP | OP_ACK => dispatch_messaging(node, req),
+        OP_STREAM_APPEND => dispatch_stream_append(node, req),
         _ => Response::BadRequest,
+    }
+}
+
+/// Falcon Event Streaming producer path: append `value` to the stream named
+/// by `keyspace`, routed to a partition by `key`. Returns the assigned
+/// partition + offset. Consumer poll/commit go over REST.
+fn dispatch_stream_append(node: &Node, req: &Request) -> Response {
+    let name = match std::str::from_utf8(&req.keyspace) {
+        Ok(s) => s,
+        Err(_) => return Response::BadRequest,
+    };
+    match node.messaging().stream(name) {
+        Some(stream) => match stream.append_keyed(&req.key, req.value.to_vec()) {
+            Ok((partition, offset)) => Response::Stored {
+                partition: partition as u32,
+                offset,
+            },
+            Err(_) => Response::ServerError,
+        },
+        None => Response::UnknownStream,
     }
 }
 

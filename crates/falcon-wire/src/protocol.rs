@@ -32,6 +32,10 @@ pub const OP_SUBSCRIBE: u8 = 0x11; // keyspace=topic; connection becomes a subsc
 pub const OP_PUSH: u8 = 0x12; // keyspace=queue, value=payload
 pub const OP_POP: u8 = 0x13; // keyspace=queue, key=group -> returns offset(8B)+payload
 pub const OP_ACK: u8 = 0x14; // keyspace=queue, key=group, value=offset(8B)
+// Falcon Event Streaming. keyspace=stream name, key=partition key,
+// value=payload. Returns a Stored{partition,offset} frame. The high-throughput
+// producer path; consumer poll/commit go over REST (request/response).
+pub const OP_STREAM_APPEND: u8 = 0x20;
 
 // Status codes.
 pub const STATUS_OK: u8 = 0x00;
@@ -45,6 +49,8 @@ pub const STATUS_MESSAGE: u8 = 0x07; // a pushed subscription message / POP resu
 pub const STATUS_UNKNOWN_TOPIC: u8 = 0x08;
 pub const STATUS_UNKNOWN_QUEUE: u8 = 0x09;
 pub const STATUS_UNAUTHORIZED: u8 = 0x0a; // auth required or token mismatch
+pub const STATUS_UNKNOWN_STREAM: u8 = 0x0b; // stream name not configured
+pub const STATUS_STORED: u8 = 0x0c; // stream append: payload = partition(4B)+offset(8B)
 
 /// Reject absurd/hostile frame sizes rather than allocating for them.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -74,9 +80,12 @@ pub enum Response {
     UnknownTopic,          //
     UnknownQueue,          //
     Unauthorized,          // auth required / token mismatch
+    UnknownStream,         // stream name not configured
     /// A queue POP result or a pushed subscription message: an 8-byte
     /// big-endian offset followed by the payload.
     Message { offset: u64, payload: Vec<u8> },
+    /// A stream append result: the partition (4B) and offset (8B) assigned.
+    Stored { partition: u32, offset: u64 },
 }
 
 /// Appends a request frame to `out` (little-endian). Public so clients
@@ -148,6 +157,17 @@ impl Response {
                 out.put_u32_le((8 + payload.len()) as u32);
                 out.put_u64_le(*offset);
                 out.put_slice(payload);
+            }
+            Response::UnknownStream => {
+                out.put_u8(STATUS_UNKNOWN_STREAM);
+                out.put_u32_le(0);
+            }
+            Response::Stored { partition, offset } => {
+                out.put_u8(STATUS_STORED);
+                // payload carries partition(4B) + offset(8B)
+                out.put_u32_le(12);
+                out.put_u32_le(*partition);
+                out.put_u64_le(*offset);
             }
         }
     }

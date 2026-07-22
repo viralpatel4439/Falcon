@@ -1,8 +1,22 @@
 //! A storage engine that keeps each value as an independent object via an
 //! `ObjectStore` backend (local folder today, third-party bucket via the
-//! same trait later). Simpler and more portable than the WAL: every key is
-//! a standalone durable object. Trades batched-fsync throughput for
-//! maintainability and remote-storage friendliness.
+//! same trait later). Every key is a standalone durable object.
+//!
+//! # This is a portability/inspectability tier, NOT a performance tier
+//!
+//! One object per key means **one I/O (or one billed request on a remote
+//! object store) per key** — there is no in-memory index and no batching, so
+//! reads and writes do not scale the way the other tiers do. Use file-per-key
+//! only when you specifically need each value to be its own inspectable,
+//! portable object (e.g. handing blobs to an external tool or a third-party
+//! bucket per-key).
+//!
+//! **For hot or cost-sensitive data, use the [`sharded`](crate::ShardedObjectStore)
+//! tier instead**: it hashes keys into a fixed number of buckets (one object
+//! per *bucket*, not per key), serves reads O(1) from an in-memory index, and
+//! coalesces writes — so N keys cost a fixed object count regardless of N.
+//! That is the object-store engine you want under load; file-per-key is the
+//! simple, one-object-per-key seam.
 
 use crate::engine::{StorageEngine, StorageError, StorageTier};
 use crate::lock_table::KeyLockTable;

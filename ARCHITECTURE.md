@@ -10,6 +10,43 @@ This document explains how the pieces fit, the data structures and algorithms
 that make the hot paths fast, and the design of the two subsystems added most
 recently: the **sharded storage engine** and **Falcon Event Streaming**.
 
+## System overview
+
+Every client protocol is a thin front-end over one shared `Node`. They call the
+same `Keyspace` / `Messaging` methods, so durability, ordering, replication, and
+metrics are identical no matter how a request arrives.
+
+```
+                 ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+   clients  ───▶ │ REST / HTTP  │  │ Binary wire  │  │  WebSocket   │
+                 │   :8080      │  │   :6380      │  │  /subscribe  │
+                 └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+                        │   auth · body-limit · metrics     │
+                        └───────────────┬───────────────────┘
+                                        ▼
+                              ┌────────────────────┐
+                              │        Node        │  composition root
+                              │  (Arc, shared)     │  + Metrics registry
+                              └─────────┬──────────┘
+             ┌───────────────┬──────────┼───────────┬─────────────────┐
+             ▼               ▼          ▼           ▼                 ▼
+        ┌─────────┐   ┌────────────┐ ┌──────┐ ┌───────────┐   ┌──────────────┐
+        │Keyspace │   │ Messaging  │ │ TTL  │ │ Ops tasks │   │ Replication  │
+        │ (KV)    │   │ topics/    │ │reaper│ │ compactor │   │ gRPC :7070   │
+        │         │   │ queues/    │ │      │ │ shutdown  │   │ leader/multi │
+        │ engine  │   │ STREAMS    │ └──────┘ └───────────┘   └──────┬───────┘
+        └────┬────┘   └─────┬──────┘                                 │
+             ▼              ▼                              ships ordered log
+     ┌───────────────┐  durable append logs                    to followers
+     │ StorageEngine │  (topic/queue/stream/offset files)
+     │ hot·warm·cold │
+     │ tiered·sharded│  ◀── every KV write becomes one ChangeEvent, observed
+     │ file-per-key  │      identically by subscribers AND replication
+     └───────────────┘
+```
+
+The rest of this document goes tier by tier and subsystem by subsystem.
+
 ---
 
 ## 1. Crate map
@@ -247,6 +284,25 @@ Use a **topic** for simple fan-out, a **queue** for work distribution with
 acks, and a **stream** when you need ordered-by-key, replayable, partitioned
 event history with independent consumer groups.
 
+### 6.5 Network API
+
+Streams are usable over the wire, not just as a library primitive:
+
+- **REST** (`falcon-api/src/rest/streams.rs`) — the full consumer lifecycle:
+  - `POST /streams/{s}/records?key=K` — append (body = payload) → `{partition, offset}`
+  - `GET  /streams/{s}/poll?group=G&partition=P` — records after the group's commit
+  - `POST /streams/{s}/commit?group=G&partition=P&offset=O` — durably advance the cursor
+  - `GET  /streams/{s}` — metadata (partition count)
+- **Binary wire protocol** — `OP_STREAM_APPEND` (`0x20`), the high-throughput
+  producer path: `keyspace` = stream, `key` = partition key, `value` = payload;
+  reply is a `Stored{partition, offset}` frame. Auth-gated like every other op
+  (the connection must AUTH first when a key is configured). Consumer
+  poll/commit are request/response and live on REST.
+
+The append path is durable-before-ack (append + fsync, then the live
+broadcast), so no consumer — polling or live-tailing — ever observes a record
+that isn't persisted.
+
 ---
 
 ## 7. Operations layer (single-image, autoscale-ready)
@@ -350,6 +406,26 @@ can allocate. `0` disables the cap.
 - **Zero `unsafe`**, compiler-enforced on every crate; fuzz-tested parsers;
   crash-recovery tests for every durable format (WAL, message log, bucket
   objects, offset files).
+
+### Measured performance
+
+From `falcon-bench` (`--release`, LTO) on a development Mac (Apple Silicon,
+APFS). Reproducible via the commands in the README's Benchmarks section.
+
+| Path | Throughput | p50 | p99 |
+|------|-----------:|----:|----:|
+| Wire GET, pipeline d=128 | 5.6 M ops/sec | 152 µs | 341 µs |
+| Sustained read load, 64 conns | 3.0 M ops/sec | 328 µs | 615 µs |
+| HTTP GET (JSON) | 61 K ops/sec | 79 µs | 197 µs |
+| Write, `fsync` every write (max durability) | ~1 K ops/sec | 7 ms | 11 ms |
+| Write, `interval_fsync_ms = 10` | 397 K ops/sec | 1 ms | 5 ms |
+
+The read path is Redis-class (millions of ops/sec, sub-millisecond tail). The
+write path is a **durability dial**: fsync-every-write guarantees zero
+acked-write loss and is bound by disk fsync latency; `interval_fsync_ms` trades
+a bounded loss window for a ~400× throughput gain. Every sustained test stayed
+`STABLE` (flat throughput, no tail runaway) under saturation. As of this
+writing the workspace has **104 tests across 42 binaries, all green**.
 
 ---
 

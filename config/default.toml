@@ -90,8 +90,12 @@ write_mode = "single-leader"  # "single-leader" (default): one region writes,
 # name = "blobs"
 # tier = "file-per-key"  # each value is an independent file under data_dir
 #                        # (one flat file per key, atomic write-rename). Simple,
-#                        # portable, inspectable; the seam for 3rd-party object
-#                        # stores. Slower per-write than the WAL warm tier.
+#                        # portable, inspectable. PORTABILITY TIER, NOT A HOT
+#                        # TIER: one I/O (or one billed request on a remote
+#                        # bucket) PER KEY, no in-memory index. For hot or
+#                        # cost-sensitive object storage use tier = "sharded"
+#                        # (below) instead — it's the optimized object-store
+#                        # engine (fixed object count, O(1) in-memory reads).
 # subscriptions = false
 # replication = false    # cannot be a replication LEADER (no ordered log)
 #
