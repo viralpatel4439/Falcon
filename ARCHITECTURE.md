@@ -1,27 +1,29 @@
 # Falcon Architecture
 
-Falcon is a single Rust binary that bundles a key-value store, pub/sub topics,
-durable work queues, **partitioned event streams**, real-time WebSocket
-subscriptions, TTL, and multi-region replication — over REST, a binary wire
-protocol, and WebSockets. Everything optional is **off by default and costs
-nothing when unused**, and every crate is `#![forbid(unsafe_code)]`.
+Falcon is a single Rust binary that provides five installable data products —
+Cache, KV Store, Pub/Sub, Queue, and Event Stream — over three protocols
+(binary TCP, REST, WebSocket), with multi-region replication, pluggable
+third-party storage, and optional TLS on every hop. Everything optional is off
+by default and adds no overhead when unused, and every crate is
+`#![forbid(unsafe_code)]`.
 
-This document explains how the pieces fit, the data structures and algorithms
-that make the hot paths fast, and the design of the two subsystems added most
-recently: the **sharded storage engine** and **Falcon Event Stream**.
+This document explains how the pieces fit, the data structures and algorithms on
+the hot paths, and the design of the replication and storage layers.
 
-## System overview
+---
 
-Every client protocol is a thin front-end over one shared `Node`. They call the
-same `Keyspace` / `Messaging` methods, so durability, ordering, replication, and
-metrics are identical no matter how a request arrives.
+## 1. System overview
+
+Every client protocol is a thin front-end over one shared `Node`. They all call
+the same `Keyspace` / `Messaging` methods, so durability, ordering, replication,
+and metrics are identical no matter how a request arrives.
 
 ```
                  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
    clients  ───▶ │ REST / HTTP  │  │ Binary wire  │  │  WebSocket   │
                  │   :8080      │  │   :6380      │  │  /subscribe  │
                  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-                        │   auth · body-limit · metrics     │
+                        │   auth · TLS · body-limit · metrics│
                         └───────────────┬───────────────────┘
                                         ▼
                               ┌────────────────────┐
@@ -34,43 +36,71 @@ metrics are identical no matter how a request arrives.
         │Keyspace │   │ Messaging  │ │ TTL  │ │ Ops tasks │   │ Replication  │
         │ (KV)    │   │ topics/    │ │reaper│ │ compactor │   │ gRPC :7070   │
         │         │   │ queues/    │ │      │ │ shutdown  │   │ leader/multi │
-        │ engine  │   │ STREAMS    │ └──────┘ └───────────┘   └──────┬───────┘
-        └────┬────┘   └─────┬──────┘                                 │
+        │ engine  │   │ streams    │ └──────┘ └───────────┘   │ /primary-q   │
+        └────┬────┘   └─────┬──────┘                          └──────┬───────┘
              ▼              ▼                              ships ordered log
      ┌───────────────┐  durable append logs                    to followers
-     │ StorageEngine │  (topic/queue/stream/offset files)
+     │ StorageEngine │  (topic/queue/stream files)
      │ hot·warm·cold │  ◀── every KV write becomes one ChangeEvent, observed
      │ tiered·sharded│      identically by subscribers AND replication
      └───────────────┘
 ```
 
-The rest of this document goes tier by tier and subsystem by subsystem.
+The five **products** are a view over these subsystems. A profile's installed
+feature set decides which keyspaces/topics/queues/streams a node builds, which
+HTTP routes mount, and which embedded UI is served.
 
 ---
 
-## 1. Crate map
+## 2. Crate map
 
 ```
-falcon-cli          the `falcon` binary: subcommands (serve + client), the
-│                   multi-core runtime, config load/merge, server wiring
-├── falcon-api      REST (axum) + WebSocket servers + embedded dashboard UI
-├── falcon-wire     binary pipelined TCP protocol (:6380)
-├── falcon-core     Node/Keyspace: ties engines to events, TTL, write modes
-│   ├── falcon-storage    storage engines (hot/warm/cold/tiered/sharded object store)
-│   ├── falcon-messaging  topics, queues, and STREAMS (event streaming)
+falcon-cli          the `falcon` binary: subcommands (install/config/peers,
+│                   serve, client verbs), profile → Config, server wiring,
+│                   multi-core runtime, replication startup
+├── falcon-api      REST (axum) + WebSocket servers, per-product embedded UIs,
+│                   route gating, /config write path, optional HTTP TLS
+├── falcon-wire     binary pipelined TCP protocol (:6380), optional TLS
+├── falcon-core     Node/Keyspace, Config, Profile, Feature model, HLC write
+│   │               paths, WriteForwarder, shared TLS loader
+│   ├── falcon-storage    engines: hot/warm/cold/tiered/sharded + remote store
+│   ├── falcon-messaging  topics, queues, streams (durable append logs)
 │   └── falcon-events     ChangeEvent, EventBus (broadcast), HLC clock
-├── falcon-replication    gRPC leader/follower + multi-leader log shipping
+├── falcon-replication    gRPC leader/follower, multi-leader, primary-queue
 ├── falcon-metrics  zero-dep counters/gauges/histograms + Prometheus encoder
-└── falcon-proto    generated gRPC types (tonic/prost)
+├── falcon-proto    generated gRPC types (tonic/prost)
+└── falcon-bench    end-to-end load tester with correctness assertions
 ```
 
-Dependency direction is strictly downward: servers depend on `falcon-core`,
-which depends on `falcon-storage` / `falcon-messaging` / `falcon-events`. No
-cycles; the storage and messaging layers never call back up.
+Dependency direction is downward: servers depend on `falcon-core`, which depends
+on `falcon-storage` / `falcon-messaging` / `falcon-events`. `falcon-replication`
+depends on `falcon-core` for the `WriteForwarder` trait. No cycles.
+
+Heavy dependencies are behind Cargo features so slim builds stay lean:
+`cold` gates `sled` (cold + tiered tiers); `remote` gates the third-party
+object-store client (reqwest + a SigV4 signer). The `full` build enables both.
 
 ---
 
-## 2. Request lifecycle (KV write)
+## 3. The product / feature model
+
+`Feature` (in `falcon-core/src/feature.rs`) is the single source of truth for
+the five products. It has two lives:
+
+1. **Compile time** — each product is a Cargo feature (`feat-cache`, …) on the
+   `falcon` binary; a slim build compiles exactly one and its dependencies.
+2. **Runtime** — the installed **profile** (`~/.falcon/profile.toml`) records
+   which product(s) a node runs. `Profile::to_config()` turns the profile into
+   the engine `Config` — each feature contributes its slice (a cache feature →
+   a tiered `cache` keyspace; pubsub → a topic; etc.).
+
+Configuration is **CLI/UI only** — Falcon reads no environment variables. The
+CLI (`install` / `config` / `peers`) and the UI's `POST /config` both write the
+same profile file; `serve` flags override it for a single run.
+
+---
+
+## 4. Request lifecycle (KV write)
 
 ```
 client ──REST/wire──▶ Server ──▶ Keyspace.put(k, v)
@@ -85,467 +115,186 @@ client ──REST/wire──▶ Server ──▶ Keyspace.put(k, v)
                                 WebSocket subscribers      Replication log shipper
 ```
 
-Every write flows through `Keyspace` (`falcon-core/src/keyspace.rs`) — the
-single place a write becomes a `ChangeEvent`. That guarantees WebSocket
-subscribers, TTL expiries, and replication all observe *exactly the same
-ordered stream*. The `EventBus` is a `tokio::broadcast` channel and is only
-constructed when subscriptions or replication are enabled for the keyspace, so
-the default path allocates nothing extra.
+Every write flows through `Keyspace` (`falcon-core/src/keyspace.rs`) — the one
+place a write becomes a `ChangeEvent`. That guarantees WebSocket subscribers,
+TTL expiries, and replication observe *exactly the same ordered stream*. The
+`EventBus` is a `tokio::broadcast` channel constructed only when subscriptions
+or replication are enabled for the keyspace, so the default path allocates
+nothing extra.
 
 ---
 
-## 3. Storage engines
+## 5. Storage engines
 
-All engines implement one trait, `StorageEngine`
-(`falcon-storage/src/engine.rs`): `get / put / delete / scan_prefix /
-apply_replicated`, each `put`/`delete` returning a monotonically increasing
-**sequence** the keyspace stamps onto the event. This uniform contract lets a
-keyspace swap engines by config with no change upstream.
+All engines implement one trait, `StorageEngine` (`falcon-storage/src/engine.rs`):
+`get / put / delete / scan_prefix / apply_replicated`, with each `put`/`delete`
+returning a monotonically increasing **sequence** the keyspace stamps onto the
+event. This uniform contract lets a keyspace swap engines by config.
 
-| Tier | Backing | Durability | Best for | Key DSA |
-|------|---------|-----------|----------|---------|
+| Tier | Backing | Durability | Best for | Key data structure |
+|------|---------|-----------|----------|--------------------|
 | `hot` | `DashMap` in RAM | none | ephemeral cache, sessions | sharded hash map |
-| `warm` (default) | RAM index + group-commit WAL | fsync'd | general purpose, low-latency durable | append log + sparse index |
+| `warm` (default) | RAM index + group-commit WAL | fsync'd | general-purpose durable | append log + sparse index |
 | `cold` | sled | fsync'd | datasets larger than RAM | B-tree (sled) |
-| `tiered` | RAM working set + disk tail | fsync'd | far-larger-than-RAM with hot set | CLOCK eviction |
-| **`sharded`** | **N bucket objects** (local dir or remote bucket) | sync or coalesced | **cheap object storage, local or 3rd-party** | **hash bucketing + in-mem index** |
+| `tiered` | RAM working set + `cold` tail | fsync'd | far-larger-than-RAM with a hot set | CLOCK eviction |
+| `sharded` | N bucket objects (local dir or remote store) | sync or coalesced | object storage, local or third-party | hash bucketing + in-mem index |
 
-### 3.1 Concurrency primitives shared across engines
+### 5.1 Shared concurrency primitives
 
 - **`KeyLockTable`** (`lock_table.rs`): a fixed array of 1024 mutexes. A key
   hashes to a shard, so writes to *different* keys almost never contend, while
   repeated writes to the *same* key serialize in arrival order. Reads take no
-  lock (DashMap/sled are already concurrent). This is per-key ordering without
-  a per-key allocation.
-- **Group-commit WAL** (`wal.rs` / `wal_writer.rs`): concurrent writers append
-  to an in-memory batch; one flusher fsyncs the batch and wakes all waiters, so
-  fsync cost amortizes across a burst. `FsyncPolicy::IntervalMs` trades a
-  bounded crash-loss window for throughput.
+  lock. This is per-key ordering without a per-key allocation.
+- **Group-commit WAL** (`wal.rs` / `wal_writer.rs`): a background task owns the
+  WAL file exclusively and batches concurrently-submitted writes into a single
+  fsync. Under light load a batch is one request (same latency as fsync-per-
+  write); under concurrent load, writes arriving during an in-flight fsync pile
+  up and flush together, so throughput scales with concurrency instead of
+  staying flat at `1 / fsync_latency`. `FsyncPolicy::IntervalMs` trades a
+  bounded crash-loss window for still-higher throughput.
+
+### 5.2 Warm tier — ordering correctness
+
+The warm engine allocates a sequence and enqueues the WAL append under a small
+`seq_order` mutex so the **durable log order always matches sequence order**.
+Without this, two writes to different keys could allocate seq N and N+1 but
+enqueue out of order, leaving the replication log unordered — which would strand
+a follower's sparse-index catch-up. The mutex is held only across a non-blocking
+channel send (never across the fsync await), so group commit still batches fully.
+
+### 5.3 Sharded tier — bucket-per-hash
+
+Keys are hashed (FNV-1a, stable across processes/platforms) into a fixed number
+of **buckets**; each bucket is one object in the backing `ObjectStore`. So a
+keyspace of millions of keys maps to `N` objects, not millions — keeping the
+number of object-store requests bounded and behaving identically on local disk
+and a remote bucket. An in-memory index (one `HashMap` per bucket behind an
+`RwLock`) serves reads in O(1) once a bucket is resident; writes re-serialize the
+touched bucket (per-write with `FlushPolicy::Sync`, or coalesced on an interval
+with `FlushPolicy::Coalesce`).
+
+### 5.4 Pluggable third-party storage
+
+The `sharded` tier is backend-agnostic — it addresses bucket objects through the
+`ObjectStore` trait (`object_store.rs`). Two implementations ship: `LocalDirStore`
+(one file per bucket under `data_dir`) and `RemoteObjectStore` (`remote_store.rs`),
+a minimal AWS-Signature-V4 signer over `reqwest` behind the `remote` feature. The
+operator supplies the endpoint + credentials (no defaults); the same client
+reaches any object store speaking the S3-style HTTP API.
 
 ---
 
-## 4. Sharded storage engine (bucket-per-hash)
+## 6. Messaging (Pub/Sub, Queue, Event Stream)
 
-**Problem it solves.** A naive object-store layout puts one object per key. On a
-request-billed object store (S3-compatible or otherwise) that means **one billed
-PUT/GET per key** — pathologically expensive at scale, and slow (a network
-round-trip per key). Falcon needs object-store portability *without* per-key
-cost, behaving the same on local disk and a remote bucket. (An earlier
-`file-per-key` tier did one object per key; it was removed for exactly this cost
-reason — `sharded` fully replaces it.)
+All three reuse the same durable append-log pattern (`messaging/src/log.rs`) and
+are owned by `Messaging`, built once at startup.
 
-**Design.** Keys are hashed into a small, fixed number of **buckets**; each
-bucket is persisted as **one object** in the backing `ObjectStore`. So a
-keyspace of millions of keys costs `N` objects, not millions.
-
-```
-        key ──FNV-1a──▶ hash ──& (N-1)──▶ bucket index (0..N)
-                                             │
-   in-memory index:  Vec<RwLock<Option<HashMap<key,val>>>>   (one per bucket)
-                                             │
-   backing store:    bucket_0, bucket_1, … bucket_{N-1}      (one object each)
-```
-
-### 4.1 Hash / bucket / shard strategy
-
-- **Hash — FNV-1a 64-bit.** Chosen over the standard-library `DefaultHasher`
-  because its output must be **stable across processes**: a key must map to the
-  same bucket after a restart. FNV-1a is fast, allocation-free, and
-  deterministic.
-- **Bucket — power-of-two masking.** `N` is rounded up to a power of two so
-  routing is a single bitmask `hash & (N-1)` (no modulo) and the distribution
-  is uniform. Bucket sizing is a tuning knob: pick `N` so a bucket object stays
-  a comfortable size (default 4096; e.g. millions of small keys → tens of KB
-  per bucket).
-- **Shard — independent bucket locks.** Each bucket has its own `RwLock` (for
-  the resident map) and `Mutex` (for load/flush I/O). Writes to different
-  buckets proceed fully in parallel; same-bucket writes serialize and
-  **coalesce** into a single object write.
-
-### 4.2 Read / write path
-
-- **Read (`get`)** — O(1). On first touch a bucket's object is fetched once and
-  decoded into the in-memory `HashMap`; every subsequent read is pure memory,
-  **zero object-store round-trips**.
-- **Write (`put`/`delete`)** — mutate the in-memory map, mark the bucket dirty,
-  then persist per the flush policy:
-  - `FlushPolicy::Sync` (default) — re-serialize and PUT the bucket object
-    before the write is acked. Fully durable; one object PUT per write.
-  - `FlushPolicy::Coalesce { interval_ms }` — a background task flushes all
-    dirty buckets every interval, so a burst of writes to hot buckets collapses
-    into **far fewer** object PUTs (dramatically cheaper on request-billed
-    stores) at the cost of a bounded crash-loss window.
-- **Prefix scan** — loads and sweeps every bucket, because hashing destroys key
-  locality. This is the deliberate tradeoff: sharding optimizes point access
-  (GET/PUT/DEL), not range scans. Use `warm`/`cold` where range scans dominate.
-
-### 4.3 Bucket object encoding
-
-Each bucket object is a compact self-framing blob, independent of any external
-serde format: `[count:u32]` then per entry `[klen:u32][key][vlen:u32][value]`,
-all big-endian. Decoding validates every length against the buffer, returning
-`CorruptWal` rather than panicking on a truncated object.
-
-### 4.4 Guarantees & limits
-
-- **Object-count bound** (tested): N buckets ⇒ ≤ N objects regardless of key
-  count.
-- **Durability across restart** (tested): reopening rebuilds each bucket's map
-  lazily from its object; deletes survive.
-- **Not a replication leader.** Sharded has no ordered
-  durable log to ship, so it can be a replication *target* (`apply_replicated`
-  works) but config rejects it as a *leader*.
+- **Topics** (`topic.rs`) — `ephemeral` (fast, in-memory, at-most-once) or
+  `durable` (persisted, replayable). A subscriber becomes a live push stream.
+- **Queues** (`queue.rs`) — a durable log plus, per consumer group, a cursor and
+  an in-flight set. `pop` hands out the next undelivered message with a
+  redelivery deadline; `ack` removes it; expired in-flight messages redeliver
+  (at-least-once). Competing consumers in one group share the stream; different
+  groups each see it in full.
+- **Streams** (`stream.rs`) — partitioned, offset-addressed, replayable logs.
+  Records route to partitions by key hash (per-key total order within a
+  partition); consumer groups keep durable per-partition committed offsets and
+  resume after restart. On a single disk each partition fsyncs independently, so
+  more partitions trade single-node write throughput for parallel ordering (as
+  in Kafka); `interval_fsync_ms` coalesces fsyncs to reclaim throughput.
 
 ---
 
-## 5. Messaging layer
+## 7. Multi-region replication
 
-Three primitives share one durable append-log pattern (`log.rs`):
-`[len:u32][offset:u64][ts:u128][payload]`, which truncates cleanly to the last
-whole record after a crash.
+Replication ships each keyspace's ordered change log to other regions over gRPC
+(`:7070`). A follower resumes from `engine.last_applied_sequence()` (durable on
+the follower), so it never loses data across reconnects. There are three write
+models (`WriteMode`):
 
-- **Topics** (`topic.rs`) — pub/sub. `ephemeral` = in-memory broadcast
-  (at-most-once, lowest latency); `durable` = persisted + replayable from an
-  offset.
-- **Queues** (`queue.rs`) — durable, at-least-once work distribution with ack +
-  redelivery-on-timeout and competing consumers per group.
-- **Streams** (`stream.rs`) — **Falcon Event Stream**, below.
+### 7.1 Single-leader (default)
 
-### 5.1 Group-committed message log
+One region (`role=leader`) accepts writes and streams its log; followers replay
+it. Strong ordering. A follower stays *live* but *not ready* until caught up.
 
-`MessageLog` (`log.rs`) uses the same **group commit** as the KV WAL, and for
-the same reason: fsync is the cost, so batch it. A dedicated background writer
-thread owns the file; `append` assigns an offset, hands the framed bytes to the
-writer over a channel, and blocks until the writer confirms durability. The
-writer drains *every* queued request into one batch, writes them all, and does a
-**single** fsync — so a burst of N concurrent appends costs one fsync, not N.
-Each `append` still returns only once its own bytes are fsynced, so per-message
-durability is unchanged. This took durable pub/sub, queue, and stream appends
-from ~270 ops/sec (one fsync each) to ~4,300 ops/sec (see §9).
+### 7.2 Multi-leader (active-active)
 
-Two further points make this effective end-to-end:
+Every node is a leader and lists the others as `peers`. A local write is stamped
+with a **Hybrid Logical Clock** (`events/src/hlc.rs`) and applied via the warm
+engine's last-write-wins path; replicated events converge via LWW, re-broadcast
+only if they win. All regions converge deterministically — but of two concurrent
+same-key writes, the higher-HLC one wins and the other is **dropped** (HLC is not
+a perfect global clock, so "wins" ≠ "was truly last"). Use primary-queue if no
+write may be lost.
 
-- **Non-blocking dispatch.** The wire and REST servers run messaging appends on
-  the blocking pool (`spawn_blocking`), so a slow fsync never stalls the async
-  worker driving other pipelined connections — this was the single biggest win.
-- **Shared cross-partition writer.** All partitions of one stream share a single
-  group-commit writer thread (`SharedWriter`), which fsyncs each *touched*
-  partition file once per drain. On one disk, N partitions still cost N
-  independent fsyncs (inherent — like Kafka), so partition count is an
-  ordering-parallelism-vs-throughput dial; a per-stream `interval_fsync_ms`
-  coalesces fsyncs on a timer to reclaim throughput at a bounded loss window.
+### 7.3 Primary-queue (no lost writes)
 
----
+One region is the **primary**. A non-primary node installs a `WriteForwarder`
+(`falcon-core`) whose `put`/`delete` **forward the write to the primary** over a
+`ForwardWrite` gRPC instead of writing locally. The primary commits every write
+(its own + forwarded) through its single ordered write path — a total order, no
+LWW, no dropped writes — then streams the committed log to every region, which is
+what actually mutates each region's local storage. The forwarded write's ack
+returns the sequence the primary durably committed.
 
-## 6. Falcon Event Stream
+### 7.4 Catch-up
 
-A **stream** is the Kafka-shaped sibling of a topic. Where a topic is a single
-log with live fan-out, a stream adds the three things an event pipeline needs:
-**partitioning**, **consumer groups with durable offsets**, and
-**replay + live tail**.
-
-```
-producer.append_keyed(key, payload)
-        │
-        │  partition = FNV-1a(key) % P            (same key ⇒ same partition ⇒ ordered)
-        ▼
-  ┌───────────── Stream "user-events" (P partitions) ─────────────┐
-  │  partition_0.log   partition_1.log   …   partition_{P-1}.log   │  durable, offset-addressed
-  │        │                 │                      │              │
-  │   broadcast tx      broadcast tx           broadcast tx        │  live tail
-  └───────────────────────────────────────────────────────────────┘
-        │
-   consumer groups (durable committed offset per partition):
-     group "analytics":  [c0=12, c1=8,  … ]   ← resumes after commit on restart
-     group "audit":      [c0=0,  c1=0,  … ]   ← independent cursor, full stream
-```
-
-### 6.1 Partitioning
-
-- `partition = FNV-1a(partition_key) % partitions`. Records sharing a key land
-  on the **same partition** and are therefore **totally ordered** relative to
-  each other; unrelated keys spread across partitions for parallelism. The same
-  stable hash as the sharded store — a key's partition never shifts on restart.
-- Each partition is an independent durable `MessageLog`. A record's durable
-  coordinate is `(partition, offset)`, offsets 1-based and monotonic per
-  partition.
-- Producers can also `append_to(partition, …)` directly (e.g. round-robin
-  producers that partition themselves).
-
-### 6.2 Consumer groups & offset commit
-
-- A group holds one **committed offset per partition**, persisted in a tiny
-  per-group file (`[count:u32]` then `offset:u64` × partitions), written via
-  temp-file-and-rename so a crash never leaves a torn offset file.
-- `poll(group, partition)` returns records *after* the group's committed offset
-  — it does **not** commit. The consumer commits after processing
-  (`commit(group, partition, offset)`), which is what makes delivery
-  **at-least-once**: a crash between poll and commit replays uncommitted
-  records rather than losing them.
-- Commits are **monotonic** (a backwards commit is ignored). Different groups
-  have independent cursors, so each group sees the full stream.
-- On reopen, committed offsets are recovered from the offset files, so a
-  consumer resumes exactly where it left off (tested).
-
-### 6.3 Live tail
-
-Each partition also has a `tokio::broadcast` sender: `subscribe(partition)`
-delivers records appended from now on, with the durable log always available to
-replay anything a slow live subscriber lagged past. Durability precedes the
-broadcast (append+fsync, *then* send), so a live consumer never sees a record
-that isn't persisted.
-
-### 6.4 Streams vs. topics vs. queues
-
-| | Topic (durable) | Queue | Stream |
-|--|------------------|-------|--------|
-| Ordering | single log | per-group FIFO-ish | **per-partition (per-key)** |
-| Parallelism | none | competing consumers | **partitions × groups** |
-| Cursor | subscriber offset | server-side ack | **durable per-group, per-partition** |
-| Replay | yes | no (consumed) | **yes, from any offset** |
-| Delivery | at-least-once from cursor | at-least-once + redelivery | at-least-once from last commit |
-
-Use a **topic** for simple fan-out, a **queue** for work distribution with
-acks, and a **stream** when you need ordered-by-key, replayable, partitioned
-event history with independent consumer groups.
-
-### 6.5 Network API
-
-Streams are usable over the wire, not just as a library primitive:
-
-- **REST** (`falcon-api/src/rest/streams.rs`) — the full consumer lifecycle:
-  - `POST /streams/{s}/records?key=K` — append (body = payload) → `{partition, offset}`
-  - `GET  /streams/{s}/poll?group=G&partition=P` — records after the group's commit
-  - `POST /streams/{s}/commit?group=G&partition=P&offset=O` — durably advance the cursor
-  - `GET  /streams/{s}` — metadata (partition count)
-- **Binary wire protocol** — `OP_STREAM_APPEND` (`0x20`), the high-throughput
-  producer path: `keyspace` = stream, `key` = partition key, `value` = payload;
-  reply is a `Stored{partition, offset}` frame. Auth-gated like every other op
-  (the connection must AUTH first when a key is configured). Consumer
-  poll/commit are request/response and live on REST.
-
-The append path is durable-before-ack (append + fsync, then the live
-broadcast), so no consumer — polling or live-tailing — ever observes a record
-that isn't persisted.
+A new or far-behind follower can pull a full snapshot (`GetSnapshot`) instead of
+replaying the entire log entry by entry; live tailing uses the event bus as a
+low-latency wake hint plus a short safety poll, so correctness never depends on a
+wake being delivered.
 
 ---
 
-## 7. Operations layer (single-image, autoscale-ready)
+## 8. Protocols
 
-Falcon is designed to run as **one autoscalable container**. Four subsystems
-make that safe; all are on by default with tunable, production-safe values.
+- **Binary wire** (`falcon-wire`) — a length-delimited TCP protocol built for
+  pipelining: every field is length-prefixed, so a client can send many requests
+  back-to-back over one persistent connection and the server replies in order
+  (no request IDs, Redis-RESP-style). Ops: `GET/SET/DEL/PING/AUTH`,
+  `PUBLISH/SUBSCRIBE`, `PUSH/POP/ACK`, `STREAM_APPEND`. This is the low-latency
+  hot path. `TCP_NODELAY` is set so pipelined replies flush immediately.
+- **REST/JSON** (`falcon-api`, axum) — the ubiquitous path for the KV, messaging,
+  stream, health, metrics, and config endpoints; also serves the embedded UI.
+- **WebSocket** (`/subscribe`) — server-push change feeds for realtime KV and
+  Pub/Sub.
+- **gRPC/HTTP2** (`falcon-replication`, tonic) — node-to-node replication:
+  streaming, flow-controlled, multiplexed.
 
-### 7.1 Metrics (`falcon-metrics`)
-
-A zero-dependency registry of lock-free atomic **counters** and **gauges** plus
-fixed-bucket latency **histograms**, rendered to the Prometheus text format at
-`GET /metrics`. Incrementing a counter is one relaxed atomic add — instrumenting
-the request path is effectively free, and when nobody scrapes, the only cost is
-those adds. The registry lives on the `Node` behind an `Arc` and is shared with
-the HTTP and wire servers, so every path records into the same series. Exposed
-signals include op counts, GET hit/miss, per-op latency histograms, WAL bytes,
-replication lag, and connection/subscription gauges — everything an HPA/KEDA
-autoscaler needs to scale on real throughput and tail latency.
-
-### 7.2 Liveness vs. readiness
-
-- `GET /healthz` — **liveness**: 200 whenever the process is up. Drives the
-  orchestrator's restart decision.
-- `GET /readyz` — **readiness**: 200 only once startup has completed (and, in
-  principle, a follower has caught up), 503 otherwise. Orchestrators route
-  traffic on readiness but restart on liveness, so a catching-up node stays
-  alive without receiving reads. Backed by the `falcon_ready` gauge.
-
-Both, plus `/metrics`, bypass auth so probes/scrapers work without a key.
-
-### 7.3 Graceful shutdown
-
-`shutdown_signal()` resolves on `SIGTERM` (k8s/docker stop) or Ctrl-C. It fans
-out over a broadcast channel to every server, which stop accepting and drain
-in-flight work via axum's `with_graceful_shutdown` / a `select!` on the wire
-accept loop. Once drained, the process marks itself not-ready and calls
-`Node::flush_all()`, which invokes `StorageEngine::flush` on every keyspace —
-the authoritative final persist that closes the sharded store's coalesce window
-and any interval-fsync WAL gap. Bounded by `[ops] shutdown_grace_secs`. This is
-what makes autoscaling and rolling deploys **zero-loss**.
-
-### 7.4 WAL compaction
-
-The warm-tier WAL is append-only, so without compaction a long-lived container's
-disk and restart-replay time grow without bound. A background task
-(`Node::spawn_compactor`) periodically rewrites each eligible WAL as a snapshot
-of only the **live** keys — dropping every superseded value and tombstone — via
-`WarmEngine::compact_inner`:
-
-1. Take the WAL's exclusive `RwLock` write guard (normal writes hold a shared
-   read guard, so they briefly pause; reads never touch this lock).
-2. Snapshot live keys from the in-memory map (deterministic key order), each
-   carrying its current HLC.
-3. Write them to a temp WAL, fsync, and **atomically rename** over the live WAL
-   (a crash before the rename leaves the old WAL intact; after, the new one is
-   fully durable).
-4. Spawn a fresh `WalWriter` on the compacted file and swap it in; replace the
-   shared sparse index's contents in place.
-
-Compaction **renumbers sequences**, which would break a replication leader's
-watermark contract, so `Node::compact_all` skips replicated keyspaces. It also
-only runs once a WAL exceeds `[ops] compaction_min_bytes`, so small/idle stores
-are never rewritten needlessly.
-
-### 7.5 Anti-OOM
-
-`[storage] max_value_bytes` (default 64 MiB) caps request body size via an axum
-`DefaultBodyLimit` layer, so a single huge PUT is rejected with `413` before it
-can allocate. `0` disables the cap.
-
-### 7.6 CLI & embedded web console
-
-The `falcon` binary (`falcon-cli`) is both the server and the client:
-
-- **`falcon serve`** loads the node's profile (`~/.falcon/profile.toml`, written
-  by `falcon install`/`falcon config` or the UI — never env vars) and builds an
-  explicit multi-threaded Tokio runtime, one worker per logical CPU by default
-  (`--worker-threads N` to pin), so every active subsystem runs concurrently
-  across all cores. `serve` flags override the profile for a single run:
-  **profile < serve flags**. The profile's `features` decide which products the
-  node runs, which routes mount, and which UI is served.
-- **Client subcommands** (`get/put/del/scan`, `topic publish`, `queue
-  push/pop`, `stream append/poll`, `health`, `metrics`) are synchronous
-  (blocking `reqwest`) one-shots that hit the node's REST API at `--addr`.
-- **Embedded web console** (`falcon-api/assets/dashboard.html`,
-  `include_str!`-baked into the binary, served at `/`): a single self-contained
-  page — no build step, no external assets — that drives the same REST API and
-  `/metrics` a human would. Live metric tiles, component status, a KV browser
-  (scan/put/delete), and topic/queue/stream listings, refreshing every 2 s. It
-  and the liveness/metrics endpoints bypass auth to load; its *data* calls carry
-  the API key.
-
-To make these usable, pub/sub and queues gained REST routes
-(`/topics/{t}/publish`, `/queues/{q}/push|pop|ack`) alongside the existing
-stream routes, so all messaging is reachable over HTTP as well as the wire
-protocol.
+**TLS** is optional and shared: one rustls loader (`falcon-core/src/tls.rs`)
+feeds all three server hops (HTTP via a tokio-rustls accept loop into hyper,
+wire via a tokio-rustls acceptor around the generic connection handler, gRPC via
+tonic's `ServerTlsConfig`). rustls uses AES-NI; on Falcon's persistent
+connections the handshake is a one-time per-connection cost, so per-op latency
+stays microsecond-scale.
 
 ---
 
-## 8. Events & replication
+## 9. Observability & operations
 
-- **`ChangeEvent`** carries keyspace, key, value (Put/Delete), sequence,
-  timestamp, origin region, and an **HLC** stamp.
-- **Single-leader** (default): the leader ships its ordered engine log to
-  followers over gRPC; `sequence` orders writes; `apply_replicated` is
-  idempotent (no-op if `sequence <= last_applied`).
-- **Multi-leader** (active-active): every write is stamped with a **Hybrid
-  Logical Clock** and applied via last-write-wins. Concurrent same-key writes
-  converge deterministically (one wins, no merge) — eventual consistency. Only
-  the warm tier supports it (HLC is persisted there).
-- The `sharded` object-store tier has no ordered log, so it can be a replication
-  *target* but not a *leader* — enforced at config validation.
+`falcon-metrics` is a zero-dependency core: lock-free atomic counters/gauges and
+a fixed-bucket latency histogram, rendered to Prometheus text. Incrementing a
+counter is one relaxed atomic add — instrumenting the request path is effectively
+free, and the only cost when nobody scrapes is those adds.
 
-### 8.1 Ordering & catch-up under concurrent writes
-
-Single-leader replication depends on the WAL being **strictly ordered by
-sequence**: the leader streams `read_replog_from(last_sent)` and the follower
-tracks a sequence watermark. Two invariants make that hold under concurrent
-writers (found and fixed via the concurrent `--bench-all`):
-
-- **Atomic sequence + append.** Writes to *different* keys don't share the
-  per-key lock, so two of them can allocate sequence N and N+1 concurrently. If
-  they then enqueued to the WAL in either order, the file order wouldn't match
-  sequence order — and a follower seeking its sparse offset index by sequence
-  could skip records permanently. So sequence allocation and the WAL enqueue are
-  performed together under a short order lock (`WarmEngine::seq_and_submit`);
-  the fsync still happens *outside* it, so group commit batches fully. File
-  order now always equals sequence order.
-- **Safety re-read poll.** The leader's live-tail stream re-reads the log on a
-  new-write wake — but a wake can be missed (broadcast lag, or a write landing
-  between the historical read and the first `recv`). The stream therefore waits
-  on the wake with a short timeout and re-reads on every tick, so a stranded
-  follower always converges within one poll interval. Correctness never depends
-  on the wake; it's only a latency hint.
-
-Both are regression-tested (`falcon-storage/tests/replog_ordering.rs`) and
-verified end-to-end by the multi-region benchmark (400/400 converged, none lost,
-under 16 concurrent writers).
+Operational tasks run in the background: a **TTL reaper** sweeps expired keys; a
+**WAL compactor** rewrites a warm-tier WAL as a live-key snapshot past a size
+threshold (bounding disk + restart-replay); **graceful shutdown** on SIGTERM
+stops accepting, drains in-flight requests, and force-flushes buffered writes
+before exit. Readiness (`/readyz`) is distinct from liveness (`/healthz`) so an
+orchestrator routes traffic only to caught-up nodes while keeping catching-up
+followers alive.
 
 ---
 
-## 9. Performance & safety principles
+## 10. Safety & testing
 
-- **Pay-for-what-you-use.** Optional subsystems allocate nothing until enabled
-  per keyspace/topic/stream. The `EventBus` isn't even constructed without
-  subscribers or replication.
-- **Sharding everywhere contention would concentrate.** Lock table (1024
-  shards), sharded store buckets, and stream partitions all use the same idea:
-  hash into independent slots so unrelated work never contends.
-- **Stable hashing** (FNV-1a) wherever a hash must survive a restart (bucket
-  routing, partition routing).
-- **Amortized fsync** via group commit (WAL) and coalesced flush (sharded
-  store) to turn per-op durability cost into per-batch cost.
-- **Zero `unsafe`**, compiler-enforced on every crate; fuzz-tested parsers;
-  crash-recovery tests for every durable format (WAL, message log, bucket
-  objects, offset files).
-
-### Measured performance
-
-From `falcon-bench` (`--release`, LTO) on a development Mac (Apple Silicon,
-APFS). Reproducible via the commands in the README's Benchmarks section.
-
-| Path | Throughput | p50 | p99 |
-|------|-----------:|----:|----:|
-| Wire GET, pipeline d=128 | 5.6 M ops/sec | 152 µs | 341 µs |
-| Sustained read load, 64 conns | 3.0 M ops/sec | 328 µs | 615 µs |
-| HTTP GET (JSON) | 61 K ops/sec | 79 µs | 197 µs |
-| Write, `fsync` every write (max durability) | ~1 K ops/sec | 7 ms | 11 ms |
-| Write, `interval_fsync_ms = 10` | 397 K ops/sec | 1 ms | 5 ms |
-
-The read path is Redis-class (millions of ops/sec, sub-millisecond tail). The
-write path is a **durability dial**: fsync-every-write guarantees zero
-acked-write loss and is bound by disk fsync latency; `interval_fsync_ms` trades
-a bounded loss window for a ~400× throughput gain.
-
-**Every subsystem** (`falcon-bench --bench-all`), durable-write throughput,
-concurrent + pipelined — each run asserts fast/reliable/safe/durable and aborts
-on any failed check:
-
-All numbers are **concurrent** (multi-connection), so they reflect real capacity.
-
-| Subsystem | Concurrent peak | Verified |
-|-----------|----------------:|----------|
-| Falcon KV Store (KV) | ~2,200 ops/sec | 4000/4000 survive hard restart |
-| Falcon Pub/Sub (durable topic) | ~4,600 ops/sec | ordered, persisted |
-| Falcon Queue | ~4,250 ops/sec | at-least-once, no redelivery of acked |
-| Falcon Event Stream (1 partition) | ~4,300 ops/sec | per-key ordered, durable resume |
-| Falcon KV Store real-time (32 subs) | ~2,270 ops/sec | every write notified |
-| Multi-region (16 concurrent writers) | ~940 ops/sec* | 400/400 converged, none lost |
-
-*\* multi-region also reports batch **convergence time** (~1.0–1.3 s for 400
-writes over async gRPC replication) — replication is async, so this is
-convergence, not per-write latency.* Every sustained test stayed `STABLE` (flat
-throughput, no tail runaway) under saturation. As of this writing the workspace
-has **105 tests across 43 binaries, all green**.
-
----
-
-## 10. Where to look in the code
-
-| Concern | File |
-|--------|------|
-| Storage trait & tiers | `crates/falcon-storage/src/engine.rs` |
-| Sharded engine | `crates/falcon-storage/src/sharded_store.rs` |
-| Object-store seam | `crates/falcon-storage/src/object_store.rs` |
-| Per-key lock table | `crates/falcon-storage/src/lock_table.rs` |
-| Group-commit WAL | `crates/falcon-storage/src/wal.rs`, `wal_writer.rs` |
-| Event streaming | `crates/falcon-messaging/src/stream.rs` |
-| Metrics registry + Prometheus | `crates/falcon-metrics/src/` |
-| WAL compaction | `crates/falcon-storage/src/warm.rs` (`compact_inner`) |
-| /metrics, /readyz, body limit, dashboard | `crates/falcon-api/src/rest/handlers.rs`, `server.rs` |
-| Embedded web console | `crates/falcon-api/assets/dashboard.html` |
-| REST topic/queue/stream routes | `crates/falcon-api/src/rest/{messaging,streams}.rs` |
-| CLI subcommands + multi-core runtime | `crates/falcon-cli/src/{cli,main,serve,client}.rs` |
-| Graceful shutdown + compactor | `crates/falcon-core/src/node.rs`, `crates/falcon-cli/src/serve.rs` |
-| Topics / queues / log | `crates/falcon-messaging/src/{topic,queue,log}.rs` |
-| Keyspace (write→event) | `crates/falcon-core/src/keyspace.rs` |
-| Node wiring | `crates/falcon-core/src/node.rs` |
-| Config & validation | `crates/falcon-core/src/config.rs` |
-| Replication | `crates/falcon-replication/src/` |
-```
+- `#![forbid(unsafe_code)]` on every crate — zero `unsafe`.
+- 121 workspace tests: storage engines (WAL recovery, group commit, compaction,
+  sparse index, LWW, sharded object count), messaging, wire pipelining/auth,
+  API auth + feature gating, config/profile round-trips, HLC ordering, and the
+  pluggable-backend seam.
+- `falcon-bench --bench-all` spawns real servers and benchmarks every product,
+  **asserting correctness on four axes** (fast / reliable / safe / durable) — a
+  failed check aborts the run, so a throughput number can never mask a
+  regression. See [Benchmarks](README.md#benchmarks) for measured results.

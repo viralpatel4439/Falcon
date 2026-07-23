@@ -16,6 +16,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub fn run(profile_flag: &Option<String>, args: ServeArgs) -> anyhow::Result<()> {
+    // Advanced/testing path: a full engine config file bypasses the profile.
+    if let Some(cfg_path) = args.config.clone() {
+        return run_from_config_file(&cfg_path, &args);
+    }
+
     let profile_path: PathBuf = profile_flag
         .clone()
         .map(PathBuf::from)
@@ -68,6 +73,61 @@ pub fn run(profile_flag: &Option<String>, args: ServeArgs) -> anyhow::Result<()>
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
 
+    runtime.block_on(async move { serve(config, active, profile_path, workers).await })
+}
+
+/// Serve from a full engine config TOML (the `--config` escape hatch). Derives
+/// the active product set from what the config declares so the API/UI gate the
+/// same way a profile would. Used by the benchmark harness and advanced setups.
+fn run_from_config_file(cfg_path: &str, args: &ServeArgs) -> anyhow::Result<()> {
+    use falcon_core::Feature;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&args.log_level))
+        .init();
+    falcon_core::tls::init_crypto_provider();
+
+    let mut config = Config::from_file(std::path::Path::new(cfg_path))?;
+    // One-run overrides still apply on top of the file.
+    if let Some(v) = &args.http_bind {
+        config.http.bind = v.clone();
+    }
+    if let Some(v) = &args.wire_bind {
+        config.wire.bind = v.clone();
+    }
+    if args.wire_disabled {
+        config.wire.enabled = false;
+    }
+    if let Some(v) = &args.data_dir {
+        config.storage.data_dir = v.clone();
+    }
+    config.validate()?;
+
+    // Derive active features from the declared objects so route gating matches.
+    let mut active = falcon_core::FeatureSet::new();
+    active.insert(Feature::Kv);
+    active.insert(Feature::Cache);
+    if !config.topics.is_empty() {
+        active.insert(Feature::Pubsub);
+    }
+    if !config.queues.is_empty() {
+        active.insert(Feature::Queue);
+    }
+    if !config.streams.is_empty() {
+        active.insert(Feature::Stream);
+    }
+
+    let mut rt = tokio::runtime::Builder::new_multi_thread();
+    rt.enable_all();
+    if let Some(n) = args.worker_threads.filter(|&n| n > 0) {
+        rt.worker_threads(n);
+    }
+    let runtime = rt.build()?;
+    let workers = args
+        .worker_threads
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    let profile_path = falcon_core::default_profile_path();
     runtime.block_on(async move { serve(config, active, profile_path, workers).await })
 }
 

@@ -162,6 +162,12 @@ pub enum PeersCmd {
 /// truth. None of these are environment variables.
 #[derive(Args, Debug, Default)]
 pub struct ServeArgs {
+    /// Advanced/testing escape hatch: load a full engine config TOML directly,
+    /// bypassing the profile. Lets you declare arbitrary keyspaces, topics,
+    /// queues, and streams for one run (used by the benchmark harness). Normal
+    /// operation uses the installed profile instead.
+    #[arg(long)]
+    pub config: Option<String>,
     /// HTTP/WebSocket/UI bind address (overrides the profile for this run).
     #[arg(long)]
     pub http_bind: Option<String>,

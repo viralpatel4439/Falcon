@@ -14,28 +14,8 @@ impl KvStoreHandle {
     /// warm tier (the default), no replication, no subscriptions — the
     /// config a real user gets out of the box.
     pub async fn spawn(binary_path: &str, port: u16, data_dir: &std::path::Path) -> Result<Self> {
-        std::fs::create_dir_all(data_dir)?;
-        let bind = format!("127.0.0.1:{port}");
-        let wire_addr = format!("127.0.0.1:{}", port + 1);
-
-        let child = Command::new(binary_path)
-            .env("FALCON_DATA_DIR", data_dir)
-            .env("FALCON_HTTP_BIND", &bind)
-            .env("FALCON_WIRE_BIND", &wire_addr)
-            .env("FALCON_LOG_LEVEL", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to spawn falcon; build it first with `cargo build --release -p falcon-cli`")?;
-
-        let base_url = format!("http://{bind}");
-        wait_for_ready(&base_url).await?;
-
-        Ok(Self {
-            child,
-            base_url,
-            wire_addr,
-        })
+        // Default warm-tier keyspace, no messaging.
+        Self::spawn_with_config(binary_path, port, data_dir, "").await
     }
 
     /// Spawn kvstored with the default keyspace on the warm tier using
@@ -60,9 +40,10 @@ impl KvStoreHandle {
         )?;
 
         let child = Command::new(binary_path)
+            .arg("serve")
             .arg("--config")
             .arg(&cfg_path)
-            .env("FALCON_LOG_LEVEL", "warn")
+            .arg("--log-level").arg("warn")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -97,9 +78,10 @@ impl KvStoreHandle {
         std::fs::write(&cfg_path, format!("{header}{config_body}"))?;
 
         let child = Command::new(binary_path)
+            .arg("serve")
             .arg("--config")
             .arg(&cfg_path)
-            .env("FALCON_LOG_LEVEL", "warn")
+            .arg("--log-level").arg("warn")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
