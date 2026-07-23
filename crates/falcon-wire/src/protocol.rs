@@ -32,7 +32,7 @@ pub const OP_SUBSCRIBE: u8 = 0x11; // keyspace=topic; connection becomes a subsc
 pub const OP_PUSH: u8 = 0x12; // keyspace=queue, value=payload
 pub const OP_POP: u8 = 0x13; // keyspace=queue, key=group -> returns offset(8B)+payload
 pub const OP_ACK: u8 = 0x14; // keyspace=queue, key=group, value=offset(8B)
-// Falcon Event Streaming. keyspace=stream name, key=partition key,
+// Falcon Event Stream. keyspace=stream name, key=partition key,
 // value=payload. Returns a Stored{partition,offset} frame. The high-throughput
 // producer path; consumer poll/commit go over REST (request/response).
 pub const OP_STREAM_APPEND: u8 = 0x20;

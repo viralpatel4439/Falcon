@@ -1,29 +1,33 @@
+# Multi-region replication example — two Falcon KV nodes, a leader in us-east
+# and a follower in eu-west, replicating over gRPC.
+#
+# Falcon is configured through its CLI only (no env vars, no --config file). Each
+# service installs the KV product into its profile with the right region/role,
+# then serves. `falcon install` is idempotent, so restarts are safe.
 services:
   leader:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    environment:
-      FALCON_NODE_ID: leader-us-east
-      FALCON_REGION: us-east-1
     volumes:
       - leader-data:/data
     ports:
       - "8080:8080"   # HTTP / WebSocket
       - "6380:6380"   # binary wire protocol
       - "7070:7070"   # gRPC replication
-    configs:
-      - source: leader-config
-        target: /config/config.toml
-    entrypoint: ["falcon", "serve", "--config", "/config/config.toml"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        falcon install kv --node-id leader-us-east --region us-east-1
+        --data-dir /data --http-bind 0.0.0.0:8080 --replicate --role leader &&
+        falcon config set grpc-bind 0.0.0.0:7070 &&
+        falcon config set wire-enabled true &&
+        falcon serve
 
   follower:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    environment:
-      FALCON_NODE_ID: follower-eu-west
-      FALCON_REGION: eu-west-1
     volumes:
       - follower-data:/data
     ports:
@@ -32,69 +36,16 @@ services:
       - "7071:7070"   # gRPC replication
     depends_on:
       - leader
-    configs:
-      - source: follower-config
-        target: /config/config.toml
-    entrypoint: ["falcon", "serve", "--config", "/config/config.toml"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        falcon install kv --node-id follower-eu-west --region eu-west-1
+        --data-dir /data --http-bind 0.0.0.0:8080 --replicate --role follower
+        --leader-addr http://leader:7070 &&
+        falcon config set grpc-bind 0.0.0.0:7070 &&
+        falcon config set wire-enabled true &&
+        falcon serve
 
 volumes:
   leader-data:
   follower-data:
-
-configs:
-  leader-config:
-    content: |
-      [node]
-      id = "leader-us-east"
-      region = "us-east-1"
-
-      [http]
-      bind = "0.0.0.0:8080"
-
-      [wire]
-      enabled = true
-      bind = "0.0.0.0:6380"
-
-      [replication]
-      enabled = true
-      role = "leader"
-      grpc_bind = "0.0.0.0:7070"
-
-      [storage]
-      data_dir = "/data"
-      default_tier = "warm"
-
-      [[keyspace]]
-      name = "default"
-      tier = "warm"
-      subscriptions = true
-      replication = true
-
-  follower-config:
-    content: |
-      [node]
-      id = "follower-eu-west"
-      region = "eu-west-1"
-
-      [http]
-      bind = "0.0.0.0:8080"
-
-      [wire]
-      enabled = true
-      bind = "0.0.0.0:6380"
-
-      [replication]
-      enabled = true
-      role = "follower"
-      grpc_bind = "0.0.0.0:7070"
-      leader_addr = "http://leader:7070"
-
-      [storage]
-      data_dir = "/data"
-      default_tier = "warm"
-
-      [[keyspace]]
-      name = "default"
-      tier = "warm"
-      subscriptions = true
-      replication = true

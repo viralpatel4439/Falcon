@@ -3,7 +3,7 @@ use crate::keyspace::Keyspace;
 use falcon_events::EventBus;
 use falcon_messaging::{Messaging, QueueSpec, StreamSpec, TopicMode, TopicSpec};
 use falcon_metrics::Metrics;
-use falcon_storage::{ColdEngine, HotEngine, StorageEngine, StorageError, TieredEngine, WarmEngine};
+use falcon_storage::{HotEngine, StorageEngine, StorageError, WarmEngine};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,6 +28,10 @@ pub enum NodeError {
     Messaging(#[from] falcon_messaging::MessagingError),
     #[error("unknown keyspace '{0}'")]
     UnknownKeyspace(String),
+    #[error("tier '{0}' is not available in this build (rebuild with the 'cold' feature)")]
+    TierNotCompiled(&'static str),
+    #[error("S3 storage backend is not available in this build (rebuild with the 's3' feature)")]
+    S3NotCompiled,
 }
 
 impl Node {
@@ -261,17 +265,28 @@ fn build_keyspace(
             };
             Arc::new(WarmEngine::open_with_policy(&path, policy)?)
         }
+        #[cfg(feature = "cold")]
         TierName::Cold => {
             let path = data_dir.join(format!("{}_cold", ks_cfg.name));
-            Arc::new(ColdEngine::open(&path)?)
+            Arc::new(falcon_storage::ColdEngine::open(&path)?)
         }
+        #[cfg(feature = "cold")]
         TierName::Tiered => {
             let path = data_dir.join(format!("{}_tiered", ks_cfg.name));
             let capacity_bytes = ks_cfg.hot_capacity_mb * 1024 * 1024;
-            Arc::new(TieredEngine::open(&path, capacity_bytes, ks_cfg.evict_sample)?)
+            Arc::new(falcon_storage::TieredEngine::open(
+                &path,
+                capacity_bytes,
+                ks_cfg.evict_sample,
+            )?)
+        }
+        // Without the `cold` feature these tiers aren't compiled in; a config
+        // asking for them is rejected at load time (see Config::validate).
+        #[cfg(not(feature = "cold"))]
+        TierName::Cold | TierName::Tiered => {
+            return Err(NodeError::TierNotCompiled(ks_cfg.tier.as_str()));
         }
         TierName::Sharded => {
-            let path = data_dir.join(format!("{}_shards", ks_cfg.name));
             let policy = if ks_cfg.shard_flush_ms > 0 {
                 falcon_storage::FlushPolicy::Coalesce {
                     interval_ms: ks_cfg.shard_flush_ms,
@@ -279,7 +294,7 @@ fn build_keyspace(
             } else {
                 falcon_storage::FlushPolicy::Sync
             };
-            falcon_storage::ShardedObjectStore::open_local(&path, ks_cfg.shard_buckets, policy)?
+            build_sharded_engine(ks_cfg, config, data_dir, policy)?
         }
     };
 
@@ -301,5 +316,53 @@ fn build_keyspace(
         Ok(keyspace.with_multi_leader(config.node.id.clone()))
     } else {
         Ok(keyspace)
+    }
+}
+
+/// Build a `sharded` keyspace's engine over the configured backend: a local
+/// directory (default) or any S3-compatible object store. The sharded tier is
+/// backend-agnostic — it addresses a fixed set of bucket objects through the
+/// `ObjectStore` trait, so attaching third-party storage is just a config swap.
+fn build_sharded_engine(
+    ks_cfg: &KeyspaceConfig,
+    config: &Config,
+    data_dir: &Path,
+    policy: falcon_storage::FlushPolicy,
+) -> Result<Arc<dyn StorageEngine>, NodeError> {
+    use crate::config::StorageBackend;
+    match &config.storage.backend {
+        StorageBackend::Local => {
+            let path = data_dir.join(format!("{}_shards", ks_cfg.name));
+            Ok(falcon_storage::ShardedObjectStore::open_local(
+                &path,
+                ks_cfg.shard_buckets,
+                policy,
+            )?)
+        }
+        #[cfg(feature = "s3")]
+        StorageBackend::S3(s3) => {
+            // Give each keyspace its own object-name prefix so many keyspaces
+            // can share a single bucket without colliding.
+            let prefix = if s3.prefix.is_empty() {
+                format!("falcon/{}", ks_cfg.name)
+            } else {
+                format!("{}/{}", s3.prefix.trim_end_matches('/'), ks_cfg.name)
+            };
+            let store = Arc::new(falcon_storage::S3Store::new(falcon_storage::S3Config {
+                endpoint_url: s3.endpoint_url.clone(),
+                region: s3.region.clone(),
+                bucket: s3.bucket.clone(),
+                access_key_id: s3.access_key_id.clone(),
+                secret_access_key: s3.secret_access_key.clone(),
+                prefix,
+            })?);
+            Ok(falcon_storage::ShardedObjectStore::with_store(
+                store,
+                ks_cfg.shard_buckets,
+                policy,
+            )?)
+        }
+        #[cfg(not(feature = "s3"))]
+        StorageBackend::S3(_) => Err(NodeError::S3NotCompiled),
     }
 }

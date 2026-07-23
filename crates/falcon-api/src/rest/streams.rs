@@ -1,4 +1,4 @@
-//! REST surface for Falcon Event Streaming. Exposes the append / poll /
+//! REST surface for Falcon Event Stream. Exposes the append / poll /
 //! commit lifecycle so producers and consumer groups can drive a partitioned,
 //! durable, replayable stream over plain HTTP:
 //!

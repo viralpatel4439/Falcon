@@ -1,4 +1,4 @@
-//! Falcon Event Streaming: partitioned, offset-addressed, replayable event
+//! Falcon Event Stream: partitioned, offset-addressed, replayable event
 //! logs with durable consumer-group cursors — the Kafka-shaped sibling of
 //! pub/sub topics.
 //!

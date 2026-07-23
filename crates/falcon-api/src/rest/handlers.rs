@@ -83,18 +83,25 @@ pub struct HealthResponse {
     pub topics: Vec<String>,
     pub queues: Vec<String>,
     pub streams: Vec<String>,
+    /// The installed Falcon products active on this node (from its profile),
+    /// e.g. `["cache"]`. Drives which UI the browser renders.
+    pub products: Vec<String>,
+    /// The primary product's short name, so the UI can pick its single view
+    /// without guessing. `None` only if nothing is installed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_product: Option<String>,
 }
 
 /// The named Falcon components and whether each is active on this node.
 #[derive(Serialize)]
 pub struct FalconComponents {
-    /// FalconDB — the key-value store (always present).
+    /// Falcon KV Store — the key-value store (always present).
     pub falcon_db: bool,
     /// Falcon Queue — durable work queues.
     pub falcon_queue: bool,
     /// Falcon Pub/Sub — topics.
     pub falcon_pubsub: bool,
-    /// Falcon Realtime DB — live WebSocket subscriptions.
+    /// Falcon KV Store — real-time WebSocket updates.
     pub falcon_realtime_db: bool,
 }
 
@@ -261,13 +268,28 @@ async fn scan(
     Ok(Json(ScanResponse { items }))
 }
 
-/// The embedded dashboard UI — a single self-contained HTML page (no external
-/// assets, no build step) baked into the binary. Served at `/`. It drives the
-/// same REST API and `/metrics` a human would.
-pub async fn dashboard() -> impl IntoResponse {
+/// The embedded UI — a *separate* self-contained page per product. The page
+/// served at `/` is chosen from the node's primary installed product, so a
+/// cache-only node shows the Cache UI, a pubsub node shows the Pub/Sub UI, and
+/// so on. A full/multi-product node (or an empty profile) falls back to the
+/// combined dashboard. No external assets, no build step.
+pub async fn dashboard(State(state): State<AppState>) -> impl IntoResponse {
+    use falcon_core::Feature;
+    let html: &'static str = match state.features.iter().next() {
+        // Exactly-one-product nodes get that product's dedicated UI.
+        Some(f) if state.features.len() == 1 => match f {
+            Feature::Cache => include_str!("../../assets/ui_cache.html"),
+            Feature::Kv => include_str!("../../assets/ui_kv.html"),
+            Feature::Pubsub => include_str!("../../assets/ui_pubsub.html"),
+            Feature::Queue => include_str!("../../assets/ui_queue.html"),
+            Feature::Stream => include_str!("../../assets/ui_stream.html"),
+        },
+        // Multi-product (full) or none-installed: the combined dashboard.
+        _ => include_str!("../../assets/dashboard.html"),
+    };
     (
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../../assets/dashboard.html"),
+        html,
     )
 }
 
@@ -310,6 +332,7 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
                 subscriptions_enabled: ks.events().is_some(),
                 last_applied_sequence: ks.engine().last_applied_sequence(),
                 ttl_tracked_keys: ks.tracked_ttl_keys() as u64,
+                #[cfg(feature = "cold")]
                 tiering: ks.tier_stats().map(|s| TieringHealth {
                     hot_hit_rate: s.hit_rate(),
                     hot_keys: s.hot_keys,
@@ -317,6 +340,8 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
                     evictions: s.evictions,
                     promotions: s.promotions,
                 }),
+                #[cfg(not(feature = "cold"))]
+                tiering: None,
             }
         })
         .collect();
@@ -353,5 +378,13 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         topics: cfg.topics.iter().map(|t| t.name.clone()).collect(),
         queues: cfg.queues.iter().map(|q| q.name.clone()).collect(),
         streams: cfg.streams.iter().map(|s| s.name.clone()).collect(),
+        products: state.features.iter().map(|f| f.as_str().to_string()).collect(),
+        primary_product: state.features.iter().next().map(|f| f.as_str().to_string()),
     })
+}
+
+/// `/health` — the same payload as `/healthz`, exposed under the name the CLI
+/// and per-feature UI fetch. Kept as a thin alias so both paths stay in sync.
+pub async fn health(state: State<AppState>) -> impl IntoResponse {
+    healthz(state).await
 }

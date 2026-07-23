@@ -9,20 +9,35 @@ name = "falcon"
 path = "src/main.rs"
 
 [dependencies]
-falcon-core = { workspace = true }
-falcon-storage = { workspace = true }
-falcon-api = { workspace = true }
+falcon-core = { workspace = true, default-features = false }
+falcon-api = { workspace = true, default-features = false }
 falcon-wire = { workspace = true }
-falcon-replication = { workspace = true }
+falcon-replication = { workspace = true, default-features = false }
 falcon-proto = { workspace = true }
-falcon-events = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
-toml = { workspace = true }
-serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde_json = { workspace = true }
+
+[features]
+# Each Falcon product is a compile-time feature. The default `full` build
+# compiles every product (and every storage backend) into one `falcon` binary;
+# a slim per-product build selects exactly one, e.g.:
+#   cargo build --release --no-default-features --features feat-cache
+# A slim build pulls only the heavy dependencies that product needs — a
+# pubsub-only build omits sled (the `cold` tier); products opt into S3 storage
+# via `feat-s3`.
+default = ["full"]
+full = ["feat-cache", "feat-kv", "feat-pubsub", "feat-queue", "feat-stream", "feat-s3"]
+# Cache and KV use the warm/tiered tiers, which need sled (the `cold` feature).
+feat-cache = ["falcon-core/cold", "falcon-api/cold", "falcon-replication/cold"]
+feat-kv = ["falcon-core/cold", "falcon-api/cold", "falcon-replication/cold"]
+feat-pubsub = []
+feat-queue = []
+feat-stream = []
+# Attach third-party S3-compatible object storage (adds reqwest + SigV4 signing).
+feat-s3 = ["falcon-core/s3", "falcon-api/s3"]

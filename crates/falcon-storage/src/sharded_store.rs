@@ -1,12 +1,11 @@
 //! A storage engine that groups many keys into a small, fixed number of
 //! **buckets** (shards), storing each bucket as a single object in a backing
 //! [`ObjectStore`] (a local directory today, a third-party bucket via the same
-//! trait tomorrow). This is Falcon's object-store tier, and it is designed to be
-//! cheap on request-billed stores: an S3-compatible store bills *per request*,
-//! so a naive "one object per key" layout would mean one billed PUT/GET per key.
-//! By hashing keys into `N` buckets and persisting one object per bucket,
-//! millions of keys cost `N` objects and `N` writes per flush — not millions —
-//! and it behaves identically on local disk and remote buckets.
+//! trait tomorrow). This is Falcon's object-store tier. By hashing keys into `N`
+//! buckets and persisting one object per bucket, millions of keys map to `N`
+//! objects and `N` writes per flush — not millions — which keeps the number of
+//! object-store requests bounded and behaves identically on local disk and
+//! remote buckets.
 //!
 //! ## Strategy (shard / hash / bucket)
 //!
@@ -50,8 +49,8 @@ pub enum FlushPolicy {
     Sync,
     /// Mark the bucket dirty and let a background flusher persist it every
     /// `interval_ms`. A burst of writes to the same bucket coalesces into a
-    /// single object PUT — far cheaper on request-billed stores — at the cost
-    /// of a bounded crash-loss window (writes since the last flush).
+    /// single object PUT — far fewer object-store requests under load — with a
+    /// bounded crash-loss window (writes since the last flush).
     Coalesce { interval_ms: u64 },
 }
 

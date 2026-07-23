@@ -29,12 +29,16 @@ impl StorageTier {
 pub enum StorageError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[cfg(feature = "cold")]
     #[error("sled error: {0}")]
     Sled(#[from] sled::Error),
     #[error("corrupt WAL record at offset {0}")]
     CorruptWal(u64),
     #[error("hot tier does not support replication")]
     HotTierNotReplicable,
+    /// A remote object-store (e.g. S3) backend error.
+    #[error("object store backend error: {0}")]
+    Backend(String),
 }
 
 /// Uniform contract for all storage tiers. Implementations are responsible

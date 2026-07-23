@@ -89,7 +89,7 @@
   <div class="row">
     <!-- KV browser -->
     <div class="card">
-      <h2>FalconDB — Key/Value</h2>
+      <h2>Falcon KV Store — Key/Value</h2>
       <div class="controls" style="margin-top:10px">
         <select id="kv-keyspace" title="keyspace"></select>
         <input id="kv-prefix" placeholder="prefix filter (e.g. user:)" />
@@ -196,11 +196,11 @@ async function refresh() {
 
     // components
     const comp = hz.components||{};
-    const cmap = { falcon_db:'FalconDB', falcon_queue:'Queue', falcon_pubsub:'Pub/Sub', falcon_realtime_db:'Realtime DB' };
+    const cmap = { falcon_db:'Falcon KV Store', falcon_queue:'Falcon Queue', falcon_pubsub:'Falcon Pub/Sub', falcon_realtime_db:'Falcon KV Store (real-time)' };
     let compHtml = Object.entries(cmap).map(([k,label])=>
       `<div class="card" style="text-align:center"><h3>${label}</h3><span class="pill ${comp[k]?'on':'off'}">${comp[k]?'active':'off'}</span></div>`).join('');
     // streams presence from features
-    compHtml += `<div class="card" style="text-align:center"><h3>Event Streaming</h3><span class="pill ${(hz.features.streams>0)?'on':'off'}">${(hz.features.streams>0)?'active':'off'}</span></div>`;
+    compHtml += `<div class="card" style="text-align:center"><h3>Falcon Event Stream</h3><span class="pill ${(hz.features.streams>0)?'on':'off'}">${(hz.features.streams>0)?'active':'off'}</span></div>`;
     compHtml += `<div class="card" style="text-align:center"><h3>Replication</h3><span class="pill ${comp&&hz.replication_enabled?'on':'off'}">${hz.replication_enabled?(hz.replication_role||'on'):'off'}</span></div>`;
     $('#components').innerHTML = compHtml;
 

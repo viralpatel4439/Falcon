@@ -1,28 +1,48 @@
 use clap::{Args, Parser, Subcommand};
 
-/// Falcon — a fast, safe, multi-core data platform: FalconDB (key-value),
-/// Falcon Queue, Falcon Pub/Sub, Falcon Event Streaming, and Falcon Realtime
-/// DB, behind one binary.
+/// Falcon — installable data products behind one CLI: Falcon Cache,
+/// Falcon KV Store, Falcon Pub/Sub, Falcon Queue, and Falcon Event Stream.
+/// Every product supports multi-region low-latency replication.
 ///
-/// Run a node with `falcon serve`; talk to a running node with the client
-/// subcommands (`falcon get`, `falcon put`, `falcon topic publish`, …).
+/// Install what you want, then run it:
+///   falcon install cache            # set up a cache-only node
+///   falcon serve                    # run it (reads your profile)
+///
+/// Falcon is configured ONLY through this CLI (and the web UI) — it never reads
+/// environment variables. `falcon config set <key> <value>` edits your profile.
 #[derive(Parser, Debug)]
 #[command(name = "falcon", version, about, long_about = None)]
 pub struct Cli {
-    #[command(subcommand)]
-    pub command: Option<Command>,
+    /// Path to the profile file (default: ~/.falcon/profile.toml). A flag, not
+    /// an env var — Falcon never reads the environment for configuration.
+    #[arg(long, global = true)]
+    pub profile: Option<String>,
 
-    /// Server flags accepted directly (no subcommand) for backward compat:
-    /// `falcon --http-bind ...` behaves like `falcon serve --http-bind ...`.
-    #[command(flatten)]
-    pub serve: ServeArgs,
+    #[command(subcommand)]
+    pub command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run a Falcon node (KV, pub/sub, queues, streams, realtime, replication).
+    /// Install a Falcon product into your profile (cache | kv | pubsub | queue | stream).
+    Install(InstallArgs),
+    /// Remove a product from your profile.
+    Uninstall(UninstallArgs),
+    /// Show what's installed and the build's compiled products.
+    Status,
+
+    /// View or change configuration (the CLI/UI-only config path).
+    #[command(subcommand)]
+    Config(ConfigCmd),
+
+    /// Manage multi-region replication peers.
+    #[command(subcommand)]
+    Peers(PeersCmd),
+
+    /// Run this node using the installed profile.
     Serve(ServeArgs),
 
+    // --- Client subcommands: talk to a running node over HTTP ---
     /// Get a key's value from a running node.
     Get(KeyArgs),
     /// Put (set) a key's value. Value is read from the arg or stdin.
@@ -48,76 +68,125 @@ pub enum Command {
     Metrics(ClientArgs),
 }
 
-/// Everything needed to run a node. Every field maps to a config value and
-/// overrides the config file (defaults < file < env < flags).
+/// `falcon install <feature>` — record a product in the profile and optionally
+/// set its network/replication settings in one shot. No env vars: every option
+/// is a flag, persisted to the profile.
+#[derive(Args, Debug)]
+pub struct InstallArgs {
+    /// Which product to install: cache | kv | pubsub | queue | stream.
+    pub feature: String,
+    /// Node region (for replication routing / display).
+    #[arg(long)]
+    pub region: Option<String>,
+    /// HTTP/WebSocket/UI bind address.
+    #[arg(long)]
+    pub http_bind: Option<String>,
+    /// Node id.
+    #[arg(long)]
+    pub node_id: Option<String>,
+    /// Data directory.
+    #[arg(long)]
+    pub data_dir: Option<String>,
+    /// Shared-secret API key required on all connections (omit = auth off).
+    #[arg(long)]
+    pub api_key: Option<String>,
+    /// Enable multi-region replication for this product.
+    #[arg(long)]
+    pub replicate: bool,
+    /// Replication role: leader | follower.
+    #[arg(long)]
+    pub role: Option<String>,
+    /// Peer node addresses for multi-region low-latency replication (repeatable).
+    #[arg(long = "peer", value_name = "ADDR")]
+    pub peers: Vec<String>,
+    /// Leader address (required when role=follower).
+    #[arg(long)]
+    pub leader_addr: Option<String>,
+
+    /// Storage backend: `local` (default) or `s3` for third-party object storage.
+    #[arg(long)]
+    pub storage: Option<String>,
+    /// S3-compatible endpoint URL (e.g. https://s3.amazonaws.com, http://localhost:9000).
+    #[arg(long)]
+    pub s3_url: Option<String>,
+    /// S3 region (default us-east-1; use `auto` for Cloudflare R2).
+    #[arg(long)]
+    pub s3_region: Option<String>,
+    /// S3 bucket name.
+    #[arg(long)]
+    pub s3_bucket: Option<String>,
+    /// S3 access key id.
+    #[arg(long)]
+    pub s3_access_key: Option<String>,
+    /// S3 secret access key.
+    #[arg(long)]
+    pub s3_secret_key: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct UninstallArgs {
+    /// Which product to remove: cache | kv | pubsub | queue | stream.
+    pub feature: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCmd {
+    /// Set a config key in the profile, e.g. `falcon config set region us-east-1`.
+    Set { key: String, value: String },
+    /// Print one config value.
+    Get { key: String },
+    /// List every config key and its current value.
+    List,
+}
+
+/// Manage the replication peer set for multi-region deployments. Peers are the
+/// gRPC addresses (`host:7070`) of the other regions' nodes.
+#[derive(Subcommand, Debug)]
+pub enum PeersCmd {
+    /// Add a peer's gRPC address, e.g. `falcon peers add 10.0.0.2:7070`.
+    Add { addr: String },
+    /// Remove a peer by address.
+    Remove { addr: String },
+    /// List configured peers and the local replication settings.
+    List,
+}
+
+/// Options for `falcon serve`. Every field overrides the profile for ONE run;
+/// the profile (written by `install`/`config`) remains the durable source of
+/// truth. None of these are environment variables.
 #[derive(Args, Debug, Default)]
 pub struct ServeArgs {
-    /// Path to a TOML config file. If omitted, built-in defaults are used.
-    #[arg(long, env = "FALCON_CONFIG")]
-    pub config: Option<String>,
-
-    /// HTTP/WebSocket/UI bind address.
-    #[arg(long, env = "FALCON_HTTP_BIND")]
+    /// HTTP/WebSocket/UI bind address (overrides the profile for this run).
+    #[arg(long)]
     pub http_bind: Option<String>,
-
     /// Binary wire-protocol bind address.
-    #[arg(long, env = "FALCON_WIRE_BIND")]
+    #[arg(long)]
     pub wire_bind: Option<String>,
-
-    /// Disable the fast binary protocol server (enabled by default).
-    #[arg(long, env = "FALCON_WIRE_DISABLED")]
+    /// Disable the fast binary protocol server for this run.
+    #[arg(long)]
     pub wire_disabled: bool,
-
-    #[arg(long, env = "FALCON_NODE_ID")]
+    #[arg(long)]
     pub node_id: Option<String>,
-
-    #[arg(long, env = "FALCON_REGION")]
+    #[arg(long)]
     pub region: Option<String>,
-
-    #[arg(long, env = "FALCON_DATA_DIR")]
+    #[arg(long)]
     pub data_dir: Option<String>,
-
-    /// Default storage tier for keyspaces: hot | warm | cold | tiered | sharded.
-    #[arg(long, env = "FALCON_DEFAULT_TIER")]
-    pub default_tier: Option<String>,
-
-    /// Shared-secret API key required on all client + inter-node connections.
-    /// When unset (default), auth is OFF. Accepts `--api-key` / `--auth-token`.
-    #[arg(long = "api-key", visible_alias = "auth-token", env = "FALCON_API_KEY")]
-    pub api_key: Option<String>,
-
     /// Tokio worker threads (multi-core). 0 or unset = one per logical CPU.
-    #[arg(long, env = "FALCON_WORKER_THREADS")]
+    #[arg(long)]
     pub worker_threads: Option<usize>,
-
-    /// Declare a topic: `--topic name` or `--topic name:durable`. Repeatable.
-    #[arg(long = "topic", value_name = "NAME[:MODE]")]
-    pub topics: Vec<String>,
-
-    /// Declare a queue: `--queue name` or `--queue name:ack_secs`. Repeatable.
-    #[arg(long = "queue", value_name = "NAME[:ACK_SECS]")]
-    pub queues: Vec<String>,
-
-    /// Declare a stream: `--stream name` or `--stream name:partitions`. Repeatable.
-    #[arg(long = "stream", value_name = "NAME[:PARTITIONS]")]
-    pub streams: Vec<String>,
-
-    /// Enable WebSocket realtime subscriptions globally.
-    #[arg(long, env = "FALCON_SUBSCRIPTIONS")]
-    pub subscriptions: bool,
-
-    #[arg(long, env = "FALCON_LOG_LEVEL", default_value = "info")]
+    #[arg(long, default_value = "info")]
     pub log_level: String,
 }
 
-/// Options shared by every client subcommand.
+/// Options shared by every client subcommand. Addresses are flags (with a
+/// sensible default), never environment variables.
 #[derive(Args, Debug, Clone)]
 pub struct ClientArgs {
     /// Base URL of the node's HTTP API.
-    #[arg(long, env = "FALCON_ADDR", default_value = "http://127.0.0.1:8080")]
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
     pub addr: String,
     /// API key, if the node has auth enabled.
-    #[arg(long, env = "FALCON_API_KEY")]
+    #[arg(long)]
     pub api_key: Option<String>,
 }
 

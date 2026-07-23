@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["cold", "s3"]
+cold = ["falcon-core/cold"]
+s3 = ["falcon-core/s3"]
+
 [dependencies]
-falcon-core = { workspace = true }
-falcon-metrics = { workspace = true }
+falcon-core = { workspace = true, default-features = false }
 falcon-events = { workspace = true }
 falcon-storage = { workspace = true }
 falcon-messaging = { workspace = true }
@@ -22,4 +26,3 @@ bytes = { workspace = true }
 tokio-tungstenite = "0.24"
 reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
-serde_json = { workspace = true }

@@ -1,22 +1,59 @@
-//! `falcon serve` — run a node. Builds an explicit multi-threaded Tokio
-//! runtime (one worker per logical CPU by default, or `--worker-threads N`) so
-//! every subsystem — KV, pub/sub, queues, event streams, realtime, and
-//! replication — runs concurrently across all cores.
+//! `falcon serve` — run a node from the installed profile.
+//!
+//! Configuration comes ONLY from the profile file (written by `falcon install`
+//! / `falcon config` or the web UI). Falcon reads no environment variables.
+//! The `serve` flags may override individual fields for a single run, but the
+//! profile remains the durable source of truth.
+//!
+//! Builds an explicit multi-threaded Tokio runtime (one worker per logical CPU
+//! by default) so every active subsystem runs concurrently across all cores.
 
 use crate::cli::ServeArgs;
+use crate::features;
 use crate::replication;
-use falcon_core::config::{QueueConfig, StreamConfig, TopicConfig, TopicModeConfig};
-use falcon_core::{Config, Node};
+use falcon_core::{Config, FeatureSet, Node, Profile};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-pub fn run(args: ServeArgs) -> anyhow::Result<()> {
+pub fn run(profile_flag: &Option<String>, args: ServeArgs) -> anyhow::Result<()> {
+    let profile_path: PathBuf = profile_flag
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(falcon_core::default_profile_path);
+
+    let profile = match Profile::load(&profile_path) {
+        Ok(p) => p,
+        Err(falcon_core::ProfileError::NotFound(p)) => {
+            anyhow::bail!(
+                "no profile at {} — install a product first, e.g.:\n  falcon install cache",
+                p.display()
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    if profile.features.is_empty() {
+        anyhow::bail!("profile has no products installed — run `falcon install <feature>`");
+    }
+
+    // A profile must not activate a product this binary didn't compile in.
+    let compiled = features::compiled();
+    if let Some(missing) = profile.features.first_uncompiled(&compiled) {
+        anyhow::bail!(
+            "profile activates '{}', which this build does not include (compiled: {}).\n\
+             Run a build that includes it, or the full build.",
+            missing,
+            compiled
+        );
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&args.log_level))
         .init();
 
-    let config = build_config(&args)?;
+    let active = profile.features.clone();
+    let config = build_config(&profile, &args)?;
 
-    // Explicit multi-threaded runtime. Default worker count = logical CPUs.
     let mut rt = tokio::runtime::Builder::new_multi_thread();
     rt.enable_all();
     if let Some(n) = args.worker_threads.filter(|&n| n > 0) {
@@ -28,16 +65,13 @@ pub fn run(args: ServeArgs) -> anyhow::Result<()> {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
 
-    runtime.block_on(async move { serve(config, workers).await })
+    runtime.block_on(async move { serve(config, active, profile_path, workers).await })
 }
 
-/// Merge config file (if any) with CLI/env overrides. Order: defaults < file <
-/// env < flags (clap already applies env before flags for a single field).
-fn build_config(args: &ServeArgs) -> anyhow::Result<Config> {
-    let mut config = match &args.config {
-        Some(path) => Config::from_file(std::path::Path::new(path))?,
-        None => Config::default(),
-    };
+/// Turn the profile into a runtime `Config`, then apply any one-run `serve`
+/// flag overrides. Order: profile < serve flags. No environment layer.
+fn build_config(profile: &Profile, args: &ServeArgs) -> anyhow::Result<Config> {
+    let mut config = profile.to_config();
 
     if let Some(v) = &args.http_bind {
         config.http.bind = v.clone();
@@ -57,78 +91,21 @@ fn build_config(args: &ServeArgs) -> anyhow::Result<Config> {
     if let Some(v) = &args.data_dir {
         config.storage.data_dir = v.clone();
     }
-    if let Some(v) = &args.default_tier {
-        config.storage.default_tier = parse_tier(v)?;
-        // Apply to the default keyspace(s) that inherit the storage default.
-        for ks in &mut config.keyspaces {
-            ks.tier = config.storage.default_tier;
-        }
-    }
-    if let Some(v) = &args.api_key {
-        config.auth.api_key = v.clone();
-    } else if let Ok(legacy) = std::env::var("FALCON_AUTH_TOKEN") {
-        config.auth.api_key = legacy;
-    }
-    if args.subscriptions {
-        config.subscriptions.enabled = true;
-    }
-
-    // Declarative messaging from flags (added to whatever the file declared).
-    for spec in &args.topics {
-        let (name, mode) = split2(spec);
-        config.topics.push(TopicConfig {
-            name,
-            mode: match mode.as_deref() {
-                Some("durable") => TopicModeConfig::Durable,
-                _ => TopicModeConfig::Ephemeral,
-            },
-            capacity: 1024,
-        });
-    }
-    for spec in &args.queues {
-        let (name, ack) = split2(spec);
-        config.queues.push(QueueConfig {
-            name,
-            ack_timeout_secs: ack.and_then(|s| s.parse().ok()).unwrap_or(30),
-        });
-    }
-    for spec in &args.streams {
-        let (name, parts) = split2(spec);
-        config.streams.push(StreamConfig {
-            name,
-            partitions: parts.and_then(|s| s.parse().ok()).unwrap_or(1),
-            capacity: 1024,
-            interval_fsync_ms: 0,
-        });
-    }
 
     config.validate()?;
     Ok(config)
 }
 
-fn split2(spec: &str) -> (String, Option<String>) {
-    match spec.split_once(':') {
-        Some((a, b)) => (a.to_string(), Some(b.to_string())),
-        None => (spec.to_string(), None),
-    }
-}
-
-fn parse_tier(s: &str) -> anyhow::Result<falcon_core::TierName> {
-    use falcon_core::TierName::*;
-    Ok(match s {
-        "hot" => Hot,
-        "warm" => Warm,
-        "cold" => Cold,
-        "tiered" => Tiered,
-        "sharded" => Sharded,
-        other => anyhow::bail!("unknown tier '{other}' (use hot|warm|cold|tiered|sharded)"),
-    })
-}
-
-async fn serve(config: Config, workers: usize) -> anyhow::Result<()> {
+async fn serve(
+    config: Config,
+    active: FeatureSet,
+    profile_path: PathBuf,
+    workers: usize,
+) -> anyhow::Result<()> {
     tracing::info!(
         node_id = %config.node.id,
         region = %config.node.region,
+        products = %active,
         data_dir = %config.storage.data_dir,
         worker_threads = workers,
         "starting Falcon (multi-core)"
@@ -165,12 +142,12 @@ async fn serve(config: Config, workers: usize) -> anyhow::Result<()> {
     });
 
     let bind: std::net::SocketAddr = config.http.bind.parse()?;
-    tracing::info!(%bind, "dashboard UI at http://{bind}/  ·  metrics at /metrics");
+    tracing::info!(%bind, "product UI at http://{bind}/  ·  metrics at /metrics");
     let mut http_shutdown = shutdown_tx.subscribe();
     let http_signal = async move {
         let _ = http_shutdown.recv().await;
     };
-    falcon_api::serve_with_shutdown(node.clone(), bind, http_signal).await?;
+    falcon_api::serve_with_shutdown(node.clone(), bind, active, profile_path, http_signal).await?;
 
     node.set_ready(false);
     let grace = std::time::Duration::from_secs(config.ops.shutdown_grace_secs.max(1));

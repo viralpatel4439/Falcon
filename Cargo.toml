@@ -41,11 +41,11 @@ toml = "0.8"
 tokio-stream = "0.1"
 
 falcon-events = { path = "crates/falcon-events" }
-falcon-storage = { path = "crates/falcon-storage" }
+falcon-storage = { path = "crates/falcon-storage", default-features = false }
 falcon-proto = { path = "crates/falcon-proto" }
-falcon-replication = { path = "crates/falcon-replication" }
-falcon-api = { path = "crates/falcon-api" }
-falcon-core = { path = "crates/falcon-core" }
+falcon-replication = { path = "crates/falcon-replication", default-features = false }
+falcon-api = { path = "crates/falcon-api", default-features = false }
+falcon-core = { path = "crates/falcon-core", default-features = false }
 falcon-wire = { path = "crates/falcon-wire" }
 falcon-messaging = { path = "crates/falcon-messaging" }
 falcon-metrics = { path = "crates/falcon-metrics" }

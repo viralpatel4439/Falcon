@@ -18,6 +18,7 @@ impl From<NodeError> for ApiError {
             NodeError::UnknownKeyspace(name) => ApiError::UnknownKeyspace(name),
             NodeError::Storage(e) => ApiError::Internal(e.to_string()),
             NodeError::Messaging(e) => ApiError::Internal(e.to_string()),
+            other => ApiError::Internal(other.to_string()),
         }
     }
 }

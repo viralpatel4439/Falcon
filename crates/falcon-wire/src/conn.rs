@@ -143,7 +143,7 @@ async fn dispatch(node: &Arc<Node>, req: &Request) -> Response {
     }
 }
 
-/// Falcon Event Streaming producer path: append `value` to the stream named
+/// Falcon Event Stream producer path: append `value` to the stream named
 /// by `keyspace`, routed to a partition by `key`. Returns the assigned
 /// partition + offset. Consumer poll/commit go over REST.
 fn dispatch_stream_append(node: &Node, req: &Request) -> Response {

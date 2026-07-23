@@ -8,7 +8,7 @@ nothing when unused**, and every crate is `#![forbid(unsafe_code)]`.
 
 This document explains how the pieces fit, the data structures and algorithms
 that make the hot paths fast, and the design of the two subsystems added most
-recently: the **sharded storage engine** and **Falcon Event Streaming**.
+recently: the **sharded storage engine** and **Falcon Event Stream**.
 
 ## System overview
 
@@ -209,7 +209,7 @@ whole record after a crash.
   offset.
 - **Queues** (`queue.rs`) — durable, at-least-once work distribution with ack +
   redelivery-on-timeout and competing consumers per group.
-- **Streams** (`stream.rs`) — **Falcon Event Streaming**, below.
+- **Streams** (`stream.rs`) — **Falcon Event Stream**, below.
 
 ### 5.1 Group-committed message log
 
@@ -237,7 +237,7 @@ Two further points make this effective end-to-end:
 
 ---
 
-## 6. Falcon Event Streaming
+## 6. Falcon Event Stream
 
 A **stream** is the Kafka-shaped sibling of a topic. Where a topic is a single
 log with live fan-out, a stream adds the three things an event pipeline needs:
@@ -402,11 +402,13 @@ can allocate. `0` disables the cap.
 
 The `falcon` binary (`falcon-cli`) is both the server and the client:
 
-- **`falcon serve`** builds an explicit multi-threaded Tokio runtime — one
-  worker per logical CPU by default, `--worker-threads N` to pin — so every
-  subsystem runs concurrently across all cores. Every config value is settable
-  by flag or `FALCON_*` env (`--topic`, `--queue`, `--stream`, `--default-tier`,
-  …), overriding the TOML file: **defaults < file < env < flags**.
+- **`falcon serve`** loads the node's profile (`~/.falcon/profile.toml`, written
+  by `falcon install`/`falcon config` or the UI — never env vars) and builds an
+  explicit multi-threaded Tokio runtime, one worker per logical CPU by default
+  (`--worker-threads N` to pin), so every active subsystem runs concurrently
+  across all cores. `serve` flags override the profile for a single run:
+  **profile < serve flags**. The profile's `features` decide which products the
+  node runs, which routes mount, and which UI is served.
 - **Client subcommands** (`get/put/del/scan`, `topic publish`, `queue
   push/pop`, `stream append/poll`, `health`, `metrics`) are synchronous
   (blocking `reqwest`) one-shots that hit the node's REST API at `--addr`.
@@ -509,11 +511,11 @@ All numbers are **concurrent** (multi-connection), so they reflect real capacity
 
 | Subsystem | Concurrent peak | Verified |
 |-----------|----------------:|----------|
-| FalconDB (KV) | ~2,200 ops/sec | 4000/4000 survive hard restart |
+| Falcon KV Store (KV) | ~2,200 ops/sec | 4000/4000 survive hard restart |
 | Falcon Pub/Sub (durable topic) | ~4,600 ops/sec | ordered, persisted |
 | Falcon Queue | ~4,250 ops/sec | at-least-once, no redelivery of acked |
-| Falcon Event Streaming (1 partition) | ~4,300 ops/sec | per-key ordered, durable resume |
-| Realtime DB (32 concurrent subs) | ~2,270 ops/sec | every write notified |
+| Falcon Event Stream (1 partition) | ~4,300 ops/sec | per-key ordered, durable resume |
+| Falcon KV Store real-time (32 subs) | ~2,270 ops/sec | every write notified |
 | Multi-region (16 concurrent writers) | ~940 ops/sec* | 400/400 converged, none lost |
 
 *\* multi-region also reports batch **convergence time** (~1.0–1.3 s for 400

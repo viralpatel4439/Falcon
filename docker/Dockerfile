@@ -24,9 +24,14 @@ VOLUME ["/data"]
 # 8080 = HTTP/WebSocket, 6380 = binary wire protocol, 7070 = gRPC replication
 EXPOSE 8080 6380 7070
 
-ENV FALCON_DATA_DIR=/data
-ENV FALCON_HTTP_BIND=0.0.0.0:8080
-ENV FALCON_WIRE_BIND=0.0.0.0:6380
+# Falcon is configured via the CLI (never env vars). Bake a default profile into
+# the image (KV product, /data storage) at a fixed path, then serve from it.
+# Override the product/settings by mounting your own profile at ~/.falcon or by
+# running `docker run ... falcon-image install <feature> ...` before `serve`.
+ENV HOME=/home/falcon
+RUN falcon install kv --data-dir /data --http-bind 0.0.0.0:8080 && \
+    falcon config set wire-bind 0.0.0.0:6380 && \
+    falcon config set wire-enabled true
 
 # Liveness uses /healthz (always 200 while the process is up). Orchestrators
 # should use /readyz for readiness (503 until startup completes / a follower
@@ -37,6 +42,8 @@ HEALTHCHECK --interval=10s --timeout=2s --start-period=5s --retries=3 \
 # SIGTERM triggers graceful drain + final durable flush; give it time to finish.
 STOPSIGNAL SIGTERM
 
-# `serve` runs the node; the FALCON_* env vars above configure it. Extra flags
-# (or `--config /path`) can be appended as `docker run ... falcon-image --config …`.
-ENTRYPOINT ["falcon", "serve"]
+# `serve` runs the node from the baked-in profile. To reconfigure, run the CLI:
+#   docker run ... falcon-image config set http-bind 0.0.0.0:9090
+# then serve. Serve flags can also override for one run: falcon serve --region ...
+ENTRYPOINT ["falcon"]
+CMD ["serve"]

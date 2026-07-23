@@ -144,7 +144,7 @@ fn addr(base: u16) -> (u16, String) {
 }
 
 // ===========================================================================
-// KV / FalconDB
+// KV / Falcon KV Store
 // ===========================================================================
 
 /// KV write+read: pipelined SET then GET over the wire, then verify every
@@ -202,7 +202,7 @@ pub async fn bench_kv(records: usize, value_size: usize) -> Result<SubResult> {
 
     let (p50, p99, max) = percentiles(lat);
     Ok(SubResult {
-        name: "FalconDB (KV, durable writes)".into(),
+        name: "Falcon KV Store (KV, durable writes)".into(),
         ops: records as u64,
         elapsed,
         p50_us: p50,
@@ -362,7 +362,7 @@ pub async fn bench_queue(jobs: usize) -> Result<SubResult> {
 // Event streaming
 // ===========================================================================
 
-/// Falcon Event Streaming: append N records (wire, high-throughput producer),
+/// Falcon Event Stream: append N records (wire, high-throughput producer),
 /// then poll+commit as a consumer group over REST, asserting per-key ordering,
 /// no loss, and durable resume across restart.
 pub async fn bench_stream(records: usize) -> Result<SubResult> {
@@ -451,7 +451,7 @@ pub async fn bench_stream(records: usize) -> Result<SubResult> {
     // Latency isn't per-record here (batched append); report append batch cost.
     let (p50, p99, max) = (0, 0, 0);
     Ok(SubResult {
-        name: "Falcon Event Streaming (partitioned)".into(),
+        name: "Falcon Event Stream (partitioned)".into(),
         ops: records as u64,
         elapsed,
         p50_us: p50,
@@ -465,10 +465,10 @@ pub async fn bench_stream(records: usize) -> Result<SubResult> {
 }
 
 // ===========================================================================
-// Realtime DB (WebSocket subscriptions)
+// Falcon KV Store real-time (WebSocket subscriptions)
 // ===========================================================================
 
-/// Realtime DB: live WebSocket subscriptions. Measures two things honestly:
+/// Falcon KV Store real-time: live WebSocket subscriptions. Measures two things honestly:
 ///   • latency  — sequential write→notify round-trip (p50/p99), and
 ///   • peak     — TRUE CONCURRENT throughput: `CONNS` subscriber+writer pairs,
 ///     each on its own key, all firing at once, counting delivered notifies.
@@ -559,7 +559,7 @@ pub async fn bench_realtime(events: usize) -> Result<SubResult> {
     let peak = expected as f64 / elapsed.as_secs_f64().max(1e-9);
 
     Ok(SubResult {
-        name: "Falcon Realtime DB (WebSocket notify)".into(),
+        name: "Falcon KV Store real-time (WebSocket notify)".into(),
         ops: expected as u64,
         elapsed,
         p50_us: p50,

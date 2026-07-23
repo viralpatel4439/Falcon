@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["cold"]
+# Replicating the cold/tiered tiers needs those engines compiled in.
+cold = ["falcon-storage/cold"]
+
 [dependencies]
 falcon-events = { workspace = true }
 falcon-storage = { workspace = true }

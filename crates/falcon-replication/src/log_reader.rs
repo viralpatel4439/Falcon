@@ -1,5 +1,7 @@
 use falcon_events::{ChangeEvent, Sequence};
-use falcon_storage::{ColdEngine, StorageEngine, StorageError, StorageTier, TieredEngine, WarmEngine};
+use falcon_storage::{StorageEngine, StorageError, StorageTier, WarmEngine};
+#[cfg(feature = "cold")]
+use falcon_storage::{ColdEngine, TieredEngine};
 use std::sync::Arc;
 
 /// Reads the durable, resumable log behind a warm or cold storage engine.
@@ -21,8 +23,10 @@ impl ReplicationLogReader for WarmLogReader {
     }
 }
 
+#[cfg(feature = "cold")]
 pub struct ColdLogReader(pub Arc<ColdEngine>);
 
+#[cfg(feature = "cold")]
 impl ReplicationLogReader for ColdLogReader {
     fn read_from(&self, sequence: Sequence) -> Result<Vec<ChangeEvent>, StorageError> {
         self.0.read_replog_from(sequence)
@@ -33,8 +37,10 @@ impl ReplicationLogReader for ColdLogReader {
     }
 }
 
+#[cfg(feature = "cold")]
 pub struct TieredLogReader(pub Arc<TieredEngine>);
 
+#[cfg(feature = "cold")]
 impl ReplicationLogReader for TieredLogReader {
     fn read_from(&self, sequence: Sequence) -> Result<Vec<ChangeEvent>, StorageError> {
         self.0.read_replog_from(sequence)
@@ -59,16 +65,21 @@ pub fn build_log_reader(engine: &Arc<dyn StorageEngine>) -> Option<Arc<dyn Repli
             let concrete = any.downcast::<WarmEngine>().ok()?;
             Some(Arc::new(WarmLogReader(concrete)) as Arc<dyn ReplicationLogReader>)
         }
+        #[cfg(feature = "cold")]
         StorageTier::Cold => {
             let any = Arc::clone(engine).as_any_arc();
             let concrete = any.downcast::<ColdEngine>().ok()?;
             Some(Arc::new(ColdLogReader(concrete)) as Arc<dyn ReplicationLogReader>)
         }
+        #[cfg(feature = "cold")]
         StorageTier::Tiered => {
             let any = Arc::clone(engine).as_any_arc();
             let concrete = any.downcast::<TieredEngine>().ok()?;
             Some(Arc::new(TieredLogReader(concrete)) as Arc<dyn ReplicationLogReader>)
         }
+        // Without the `cold` feature these tiers don't exist in this build.
+        #[cfg(not(feature = "cold"))]
+        StorageTier::Cold | StorageTier::Tiered => None,
         // The sharded object-store tier has no ordered durable log to stream,
         // so it can't be a replication *source* (leader) — it can still be a
         // replication target (apply_replicated works). None reflects that.

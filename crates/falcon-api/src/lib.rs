@@ -5,5 +5,5 @@ mod server;
 mod state;
 mod ws;
 
-pub use server::{router, serve, serve_with_shutdown};
+pub use server::{router, router_for, serve, serve_with_shutdown};
 pub use state::AppState;

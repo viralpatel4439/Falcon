@@ -1,4 +1,4 @@
-use crate::rest::{handlers, messaging, streams};
+use crate::rest::{config as config_api, handlers, messaging, streams};
 use crate::state::AppState;
 use axum::routing::post;
 use crate::ws;
@@ -8,45 +8,83 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
-use falcon_core::Node;
+use falcon_core::{Feature, FeatureSet, Node};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Build a router with every product enabled (the `full` node). Convenience
+/// for embedders and tests; production `serve` uses [`router_for`] with the
+/// node's actual profile feature set.
 pub fn router(node: Arc<Node>) -> Router {
-    let state = AppState { node };
+    router_for(node, FeatureSet::all(), falcon_core::default_profile_path())
+}
+
+/// Build the router for a node, gating each product's routes on whether that
+/// product is active in the node's profile. A cache-only node exposes only the
+/// KV routes; `/topics/*`, `/queues/*`, `/streams/*` are simply not mounted, so
+/// they 404 with "feature not installed" semantics.
+pub fn router_for(node: Arc<Node>, features: FeatureSet, profile_path: PathBuf) -> Router {
+    let features = Arc::new(features);
+    let state = AppState {
+        node,
+        features: features.clone(),
+        profile_path: Arc::new(profile_path),
+    };
 
     let max_body = state.node.config().storage.max_value_bytes;
 
+    // Always-on: UI, probes, metrics, health, and the config read/write API
+    // (the UI's CLI-equivalent config path).
     let mut app = Router::new()
         .route("/", get(handlers::dashboard))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/metrics", get(handlers::metrics))
-        .route("/subscribe", get(ws::handler::ws_handler))
-        .route("/kv", get(handlers::scan_default))
-        .route(
-            "/kv/{key}",
-            get(handlers::get_key_default)
-                .put(handlers::put_key_default)
-                .delete(handlers::delete_key_default),
-        )
-        .route("/keyspaces/{keyspace}/kv", get(handlers::scan_keyspace))
-        .route(
-            "/keyspaces/{keyspace}/kv/{key}",
-            get(handlers::get_key_keyspace)
-                .put(handlers::put_key_keyspace)
-                .delete(handlers::delete_key_keyspace),
-        )
-        // Falcon Event Streaming: append / poll / commit + metadata.
-        .route("/streams/{stream}", get(streams::info))
-        .route("/streams/{stream}/records", post(streams::append))
-        .route("/streams/{stream}/poll", get(streams::poll))
-        .route("/streams/{stream}/commit", post(streams::commit))
-        // Pub/Sub topics + work queues.
-        .route("/topics/{topic}/publish", post(messaging::publish))
-        .route("/queues/{queue}/push", post(messaging::push))
-        .route("/queues/{queue}/pop", post(messaging::pop))
-        .route("/queues/{queue}/ack", post(messaging::ack));
+        .route("/health", get(handlers::health))
+        .route("/config", get(config_api::get_config).post(config_api::set_config));
+
+    // Key-value + realtime routes: present for the Cache and KV products.
+    if features.contains(Feature::Cache) || features.contains(Feature::Kv) {
+        app = app
+            .route("/subscribe", get(ws::handler::ws_handler))
+            .route("/kv", get(handlers::scan_default))
+            .route(
+                "/kv/{key}",
+                get(handlers::get_key_default)
+                    .put(handlers::put_key_default)
+                    .delete(handlers::delete_key_default),
+            )
+            .route("/keyspaces/{keyspace}/kv", get(handlers::scan_keyspace))
+            .route(
+                "/keyspaces/{keyspace}/kv/{key}",
+                get(handlers::get_key_keyspace)
+                    .put(handlers::put_key_keyspace)
+                    .delete(handlers::delete_key_keyspace),
+            );
+    }
+
+    // Falcon Event Stream.
+    if features.contains(Feature::Stream) {
+        app = app
+            .route("/streams/{stream}", get(streams::info))
+            .route("/streams/{stream}/records", post(streams::append))
+            .route("/streams/{stream}/poll", get(streams::poll))
+            .route("/streams/{stream}/commit", post(streams::commit));
+    }
+
+    // Falcon Pub/Sub.
+    if features.contains(Feature::Pubsub) {
+        app = app.route("/topics/{topic}/publish", post(messaging::publish));
+    }
+
+    // Falcon Queue.
+    if features.contains(Feature::Queue) {
+        app = app
+            .route("/queues/{queue}/push", post(messaging::push))
+            .route("/queues/{queue}/pop", post(messaging::pop))
+            .route("/queues/{queue}/ack", post(messaging::ack));
+    }
 
     // Anti-OOM: cap request body size so a single huge PUT can't exhaust
     // memory. 0 disables the cap. Applied before handlers run.
@@ -79,7 +117,12 @@ async fn auth_middleware(
     // Liveness/readiness/metrics endpoints and the static dashboard page are
     // always unauthenticated so probes, scrapers, and the UI shell load without
     // a key. (The dashboard's data calls DO carry the key and are gated.)
-    if matches!(req.uri().path(), "/" | "/healthz" | "/readyz" | "/metrics") {
+    // GET /config and /health are read-only shell data the UI needs before a
+    // key is entered; POST /config (the config write path) is NOT exempt.
+    let path = req.uri().path();
+    let exempt = matches!(path, "/" | "/healthz" | "/readyz" | "/metrics" | "/health")
+        || (path == "/config" && req.method() == axum::http::Method::GET);
+    if exempt {
         return Ok(next.run(req).await);
     }
     let token = &state.node.config().auth.api_key;
@@ -118,8 +161,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub async fn serve(node: Arc<Node>, bind: SocketAddr) -> std::io::Result<()> {
-    let app = router(node);
+pub async fn serve(
+    node: Arc<Node>,
+    bind: SocketAddr,
+    features: FeatureSet,
+    profile_path: PathBuf,
+) -> std::io::Result<()> {
+    let app = router_for(node, features, profile_path);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "HTTP/WebSocket server listening");
     axum::serve(listener, app).await
@@ -132,12 +180,14 @@ pub async fn serve(node: Arc<Node>, bind: SocketAddr) -> std::io::Result<()> {
 pub async fn serve_with_shutdown<F>(
     node: Arc<Node>,
     bind: SocketAddr,
+    features: FeatureSet,
+    profile_path: PathBuf,
     shutdown: F,
 ) -> std::io::Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let app = router(node);
+    let app = router_for(node, features, profile_path);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "HTTP/WebSocket server listening (graceful shutdown enabled)");
     axum::serve(listener, app)

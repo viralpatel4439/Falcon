@@ -1,6 +1,20 @@
-# Example configuration for Falcon. All fields have built-in defaults,
-# so running `falcon` with no --config at all also works out of the box
-# (single node, warm tier, no replication, no subscriptions).
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE (Falcon install model): Falcon is now configured through the CLI and the
+# web UI ONLY. A node's real configuration lives in ~/.falcon/profile.toml,
+# written by `falcon install <feature>` and `falcon config set <key> <value>`
+# (or the UI's config panel). Falcon does NOT read environment variables.
+#
+#   falcon install cache --region us-east-1 --replicate --peer 10.0.0.2:7070
+#   falcon config set http-bind 0.0.0.0:9090
+#   falcon serve
+#
+# This file documents the FULL internal engine config (every tier, topic, queue,
+# and stream option) for reference. Any `env = "FALCON_*"` behaviour described
+# in older docs has been removed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Reference: the full internal engine configuration. All fields have built-in
+# defaults; a profile selects the subset a given product needs.
 
 [node]
 id = "node-1"
@@ -127,7 +141,7 @@ write_mode = "single-leader"  # "single-leader" (default): one region writes,
 # ack_timeout_secs = 30   # unacked delivered messages are redelivered after this
 #                         # (durable, at-least-once, competing consumers per group)
 #
-# --- Falcon Event Streaming: partitioned, replayable event logs ---
+# --- Falcon Event Stream: partitioned, replayable event logs ---
 #
 # A stream is the Kafka-shaped sibling of a topic: records are routed to
 # PARTITIONS by key hash (records with the same key are totally ordered on one

@@ -1,4 +1,4 @@
-//! Falcon Event Streaming tests: key-ordered partitioning, durable replay,
+//! Falcon Event Stream tests: key-ordered partitioning, durable replay,
 //! consumer-group commit/resume across reopen, and live tailing.
 
 use falcon_messaging::{Messaging, StreamSpec};

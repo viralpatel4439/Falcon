@@ -1,6 +1,8 @@
 use dashmap::DashMap;
 use falcon_events::{now_millis, ChangeEvent, ChangeValue, EventBus, Hlc, HlcClock, Sequence};
-use falcon_storage::{StorageEngine, StorageError, StorageTier, TierStats, TieredEngine, WarmEngine};
+use falcon_storage::{StorageEngine, StorageError, StorageTier, WarmEngine};
+#[cfg(feature = "cold")]
+use falcon_storage::{TierStats, TieredEngine};
 use std::sync::Arc;
 
 /// Ties a storage engine to its (optional) event bus and TTL tracking. The
@@ -85,6 +87,9 @@ impl Keyspace {
     }
 
     /// Tiering stats if this keyspace uses the tiered engine, else `None`.
+    /// Only meaningful with the `cold` feature (the tiered tier); without it
+    /// there is no tiered engine, so this is always `None`.
+    #[cfg(feature = "cold")]
     pub fn tier_stats(&self) -> Option<TierStats> {
         if self.engine.tier() != StorageTier::Tiered {
             return None;

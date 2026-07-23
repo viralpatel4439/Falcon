@@ -1,4 +1,4 @@
-//! End-to-end tests for the Falcon Event Streaming REST API: append routes by
+//! End-to-end tests for the Falcon Event Stream REST API: append routes by
 //! key to a stable partition, poll returns records after a group's committed
 //! offset, and commit advances that offset (at-least-once resume).
 

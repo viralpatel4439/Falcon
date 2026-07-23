@@ -110,6 +110,10 @@ pub struct StorageConfig {
     /// this is rejected with 413. Default 64 MiB; set 0 to disable the cap.
     #[serde(default = "default_max_value_bytes")]
     pub max_value_bytes: usize,
+    /// Where a `sharded` keyspace stores its bucket objects. `local` (default)
+    /// uses `data_dir`; `s3` attaches any S3-compatible third-party store.
+    #[serde(default)]
+    pub backend: StorageBackend,
 }
 
 impl Default for StorageConfig {
@@ -118,8 +122,45 @@ impl Default for StorageConfig {
             data_dir: default_data_dir(),
             default_tier: default_tier(),
             max_value_bytes: default_max_value_bytes(),
+            backend: StorageBackend::default(),
         }
     }
+}
+
+/// The backing store for the `sharded` object-store tier. `local` writes bucket
+/// objects under `data_dir`; `s3` writes them to any S3-compatible endpoint
+/// (AWS S3, MinIO, Cloudflare R2, Backblaze B2, …) so you can attach essentially
+/// any third-party object storage by URL + credentials.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum StorageBackend {
+    #[default]
+    Local,
+    S3(S3BackendConfig),
+}
+
+/// Connection details for an S3-compatible object store.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct S3BackendConfig {
+    /// Base endpoint URL, e.g. `https://s3.amazonaws.com`,
+    /// `http://localhost:9000` (MinIO), or a provider-specific host.
+    #[serde(default)]
+    pub endpoint_url: String,
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default)]
+    pub access_key_id: String,
+    #[serde(default)]
+    pub secret_access_key: String,
+    /// Optional key prefix so multiple keyspaces can share one bucket.
+    #[serde(default)]
+    pub prefix: String,
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_string()
 }
 
 fn default_data_dir() -> String {
@@ -140,6 +181,18 @@ pub enum TierName {
     Cold,
     Tiered,
     Sharded,
+}
+
+impl TierName {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TierName::Hot => "hot",
+            TierName::Warm => "warm",
+            TierName::Cold => "cold",
+            TierName::Tiered => "tiered",
+            TierName::Sharded => "sharded",
+        }
+    }
 }
 
 impl From<TierName> for StorageTier {
@@ -376,7 +429,7 @@ fn default_ack_timeout_secs() -> u64 {
     30
 }
 
-/// One partitioned event stream (Falcon Event Streaming). Records route to
+/// One partitioned event stream (Falcon Event Stream). Records route to
 /// partitions by key hash; each partition is a durable, replayable log with
 /// per-consumer-group committed offsets.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -471,8 +524,10 @@ pub enum ConfigError {
     MultiLeaderNeedsReplication(String),
     #[error("keyspace '{0}': sharded tier cannot be a replication leader (no ordered log)")]
     ShardedReplicationLeader(String),
-    #[error("the 'file-per-key' tier was removed (too costly on object stores) — use tier = \"sharded\" instead")]
+    #[error("the 'file-per-key' tier was removed — use tier = \"sharded\" instead")]
     RemovedFilePerKey,
+    #[error("keyspace '{keyspace}': tier '{tier}' needs the 'cold' build feature (sled) — rebuild with it, or use a different tier")]
+    TierNotCompiled { keyspace: String, tier: &'static str },
     #[error("failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
     #[error("io error reading config: {0}")]
@@ -502,6 +557,14 @@ impl Config {
         for ks in &self.keyspaces {
             if ks.tier == TierName::Hot && ks.replication {
                 return Err(ConfigError::HotTierReplicationConflict(ks.name.clone()));
+            }
+            // The cold + tiered tiers require the `cold` build feature (sled).
+            #[cfg(not(feature = "cold"))]
+            if matches!(ks.tier, TierName::Cold | TierName::Tiered) {
+                return Err(ConfigError::TierNotCompiled {
+                    keyspace: ks.name.clone(),
+                    tier: ks.tier.as_str(),
+                });
             }
             // The sharded object-store tier has no ordered replication log, so
             // it can't be a leader source. Reject replication as leader; it can
