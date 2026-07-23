@@ -66,12 +66,25 @@ impl WalWriter {
     /// `Always` policy): this does not return until the batch containing
     /// this record has been fsynced.
     pub async fn submit(&self, ts_hint: Timestamp, framed: Vec<u8>) -> Result<Timestamp, StorageError> {
+        let pending = self.enqueue(framed)?;
+        pending.await.map_err(|_| wal_writer_gone())??;
+        Ok(ts_hint)
+    }
+
+    /// Enqueue a framed record and return a future that resolves when it's
+    /// durable — WITHOUT awaiting. This lets a caller assign a sequence and
+    /// enqueue it under a lock (so the WAL file order matches sequence order),
+    /// then release the lock and await durability outside it. Enqueue order ==
+    /// file order == the order the durable replication log must preserve.
+    pub fn enqueue(
+        &self,
+        framed: Vec<u8>,
+    ) -> Result<oneshot::Receiver<Result<(), StorageError>>, StorageError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
             .send(CommitRequest { framed, ack: ack_tx })
             .map_err(|_| wal_writer_gone())?;
-        ack_rx.await.map_err(|_| wal_writer_gone())??;
-        Ok(ts_hint)
+        Ok(ack_rx)
     }
 }
 

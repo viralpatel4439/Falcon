@@ -36,6 +36,14 @@ pub struct WarmEngine {
     wal_path: PathBuf,
     policy: crate::wal_writer::FsyncPolicy,
     sequence: AtomicU64,
+    /// Serializes `next_sequence()` + WAL enqueue so the WAL file order always
+    /// matches sequence order. Without this, two writes to *different* keys can
+    /// allocate seq N and N+1 but enqueue them out of order, leaving the
+    /// durable replication log unordered — which broke a follower's sparse-
+    /// index catch-up under concurrent writes. Held only across enqueue (a
+    /// non-blocking channel send), never across the fsync await, so group
+    /// commit still batches fully.
+    seq_order: tokio::sync::Mutex<()>,
     locks: KeyLockTable,
     /// Per-key HLC of the current value, for multi-region last-write-wins.
     /// Rebuilt from the WAL on open (durable), so LWW ordering survives
@@ -87,6 +95,7 @@ impl WarmEngine {
             wal_path: path.to_path_buf(),
             policy,
             sequence: AtomicU64::new(max_seq),
+            seq_order: tokio::sync::Mutex::new(()),
             locks: KeyLockTable::new(),
             hlc_index,
         })
@@ -96,13 +105,51 @@ impl WarmEngine {
         self.sequence.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Submit a framed record to the current WAL writer, holding a *read*
-    /// guard on the WAL side so a concurrent compaction (which takes the
-    /// write guard) can't swap the file out mid-append. Group commit still
-    /// batches concurrent submitters — the read guard is shared.
+    fn wal_writer_gone() -> StorageError {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "wal writer task is no longer running",
+        ))
+    }
+
+    /// Allocate the next sequence, frame the record, and enqueue it to the WAL
+    /// **atomically** (under `seq_order`) so file order == sequence order, then
+    /// await durability *outside* the order lock (so group commit still
+    /// batches). `frame` is given the freshly-allocated sequence and returns
+    /// the bytes to append. Returns the assigned sequence once durable. Used by
+    /// the single-leader write path, which feeds the ordered replication log.
+    async fn seq_and_submit(
+        &self,
+        frame: impl FnOnce(Sequence) -> (Vec<u8>, Timestamp),
+    ) -> Result<Sequence, StorageError> {
+        // Read guard: a concurrent compaction (write guard) can't swap the WAL
+        // mid-append. Order lock: seq allocation + enqueue happen together.
+        let wal = self.wal.read().await;
+        let (seq, pending) = {
+            let _order = self.seq_order.lock().await;
+            let seq = self.next_sequence();
+            let (framed, _ts) = frame(seq);
+            let pending = wal.writer.enqueue(framed)?;
+            (seq, pending)
+        };
+        drop(wal);
+        pending.await.map_err(|_| Self::wal_writer_gone())??;
+        Ok(seq)
+    }
+
+    /// Submit a pre-framed record whose sequence was already allocated (the
+    /// multi-leader LWW paths and replicated-apply, which carry an externally
+    /// assigned sequence/HLC). Ordered against the single-leader path via the
+    /// same `seq_order` lock so file order stays consistent.
     async fn submit(&self, ts: Timestamp, framed: Vec<u8>) -> Result<Timestamp, StorageError> {
-        let guard = self.wal.read().await;
-        guard.writer.submit(ts, framed).await
+        let wal = self.wal.read().await;
+        let pending = {
+            let _order = self.seq_order.lock().await;
+            wal.writer.enqueue(framed)?
+        };
+        drop(wal);
+        pending.await.map_err(|_| Self::wal_writer_gone())??;
+        Ok(ts)
     }
 
     pub fn wal_path(&self) -> &Path {
@@ -281,18 +328,20 @@ impl StorageEngine for WarmEngine {
 
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<Sequence, StorageError> {
         let _guard = self.locks.lock(key).await;
-        let seq = self.next_sequence();
-        let (framed, ts) = frame_record(seq, key, &WalOp::Put(value.to_vec()));
-        self.submit(ts, framed).await?;
+        // Sequence allocation + WAL enqueue happen atomically (file order ==
+        // sequence order) so the replication log a follower reads is ordered.
+        let seq = self
+            .seq_and_submit(|seq| frame_record(seq, key, &WalOp::Put(value.to_vec())))
+            .await?;
         self.map.insert(key.to_vec(), value.to_vec());
         Ok(seq)
     }
 
     async fn delete(&self, key: &[u8]) -> Result<Sequence, StorageError> {
         let _guard = self.locks.lock(key).await;
-        let seq = self.next_sequence();
-        let (framed, ts) = frame_record(seq, key, &WalOp::Delete);
-        self.submit(ts, framed).await?;
+        let seq = self
+            .seq_and_submit(|seq| frame_record(seq, key, &WalOp::Delete))
+            .await?;
         self.map.remove(key);
         Ok(seq)
     }

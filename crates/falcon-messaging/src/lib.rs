@@ -43,6 +43,9 @@ pub struct StreamSpec {
     pub name: String,
     pub partitions: usize,
     pub capacity: usize,
+    /// 0 = fsync every append (full durability). > 0 = coalesce fsyncs across
+    /// partitions on this interval (higher throughput, bounded loss window).
+    pub interval_fsync_ms: u64,
 }
 
 /// Owns all topics and queues, built once at startup. Cheap to clone-share
@@ -72,7 +75,13 @@ impl Messaging {
         }
         let mut stream_map = HashMap::new();
         for spec in streams {
-            let s = Stream::open(&spec.name, spec.partitions, &data_dir, spec.capacity)?;
+            let s = Stream::open_with_fsync(
+                &spec.name,
+                spec.partitions,
+                &data_dir,
+                spec.capacity,
+                spec.interval_fsync_ms,
+            )?;
             stream_map.insert(spec.name.clone(), Arc::new(s));
         }
         Ok(Self {

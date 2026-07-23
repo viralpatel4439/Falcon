@@ -161,34 +161,35 @@ impl Replication for ReplicationServerImpl {
                 }
             }
 
-            // Live tail: wake on new local writes, re-read the durable log
-            // from the last sent sequence (handles bursts/coalescing safely).
-            loop {
-                match wake.recv().await {
-                    Ok(_event) => {
-                        match log_reader.read_from(last_sent) {
-                            Ok(events) => {
-                                for event in &events {
-                                    last_sent = last_sent.max(event.sequence);
-                                    yield Ok(ChangeEventProto::from(event));
-                                }
-                            }
-                            Err(e) => {
-                                yield Err(Status::internal(e.to_string()));
-                                return;
-                            }
+            // Live tail. A new local write fires a wake on the broadcast
+            // channel; we then re-read the durable log from `last_sent` (which
+            // safely absorbs bursts, group-commit coalescing, and out-of-order
+            // submit). The wake is only a *hint* — never the source of truth.
+            //
+            // A wake can be missed (channel lag, or a write landing between the
+            // historical read and the first `recv`). To guarantee the follower
+            // always converges regardless of any wake race, we wait on the wake
+            // with a short timeout and re-read on EVERY tick as a safety poll:
+            // even if no wake ever arrives, a stranded tail is picked up within
+            // one poll interval. Correctness no longer depends on the wake.
+            const SAFETY_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+            // Loop until the wake channel closes (the keyspace is gone). Every
+            // other outcome — a wake, a lag, or a poll timeout — re-reads the log.
+            while !matches!(
+                tokio::time::timeout(SAFETY_POLL, wake.recv()).await,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed))
+            ) {
+                match log_reader.read_from(last_sent) {
+                    Ok(events) => {
+                        for event in &events {
+                            last_sent = last_sent.max(event.sequence);
+                            yield Ok(ChangeEventProto::from(event));
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Missed wake-up signals; catch up by re-reading the log.
-                        if let Ok(events) = log_reader.read_from(last_sent) {
-                            for event in &events {
-                                last_sent = last_sent.max(event.sequence);
-                                yield Ok(ChangeEventProto::from(event));
-                            }
-                        }
+                    Err(e) => {
+                        yield Err(Status::internal(e.to_string()));
+                        return;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
             let _ = keyspace;

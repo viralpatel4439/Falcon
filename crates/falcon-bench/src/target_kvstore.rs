@@ -77,6 +77,43 @@ impl KvStoreHandle {
         })
     }
 
+    /// Spawn falcon with a full config string (topics/queues/streams/
+    /// subscriptions). Used by the subsystem benchmarks that need messaging
+    /// or realtime features configured.
+    pub async fn spawn_with_config(
+        binary_path: &str,
+        port: u16,
+        data_dir: &std::path::Path,
+        config_body: &str,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        let bind = format!("127.0.0.1:{port}");
+        let wire_addr = format!("127.0.0.1:{}", port + 1);
+        let cfg_path = data_dir.join("bench-config.toml");
+        let header = format!(
+            "[http]\nbind = \"{bind}\"\n[wire]\nbind = \"{wire_addr}\"\n[storage]\ndata_dir = \"{}\"\n",
+            data_dir.display()
+        );
+        std::fs::write(&cfg_path, format!("{header}{config_body}"))?;
+
+        let child = Command::new(binary_path)
+            .arg("--config")
+            .arg(&cfg_path)
+            .env("FALCON_LOG_LEVEL", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn falcon")?;
+
+        let base_url = format!("http://{bind}");
+        wait_for_ready(&base_url).await?;
+        Ok(Self {
+            child,
+            base_url,
+            wire_addr,
+        })
+    }
+
     pub fn client(&self) -> reqwest::Client {
         reqwest::Client::builder()
             .pool_max_idle_per_host(256)

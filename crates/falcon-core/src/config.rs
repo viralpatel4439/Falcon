@@ -385,18 +385,27 @@ fn default_ack_timeout_secs() -> u64 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamConfig {
     pub name: String,
-    /// Number of partitions (min 1). More partitions = more parallelism and
-    /// ordering domains; a key is always ordered within its partition.
+    /// Number of partitions (min 1). More partitions = more parallel ordering
+    /// domains, but on a single disk each partition fsyncs independently, so
+    /// **more partitions trade single-node write throughput for parallelism**
+    /// (like Kafka — you add disks/nodes to scale partitions). Default 1. Use
+    /// `interval_fsync_ms` to reclaim throughput at higher partition counts.
     #[serde(default = "default_stream_partitions")]
     pub partitions: usize,
     /// Live broadcast buffer per partition (records a slow live subscriber
     /// can lag before it must replay from the durable log).
     #[serde(default = "default_stream_capacity")]
     pub capacity: usize,
+    /// Durability policy. 0 (default) = fsync every append (zero acked-write
+    /// loss). > 0 = coalesce fsyncs across all partitions on this interval
+    /// (ms): much higher throughput, at a bounded crash-loss window of up to
+    /// one interval. Same dial as the warm KV tier's `interval_fsync_ms`.
+    #[serde(default)]
+    pub interval_fsync_ms: u64,
 }
 
 fn default_stream_partitions() -> usize {
-    8
+    1
 }
 fn default_stream_capacity() -> usize {
     1024

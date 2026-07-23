@@ -210,6 +210,30 @@ whole record after a crash.
   redelivery-on-timeout and competing consumers per group.
 - **Streams** (`stream.rs`) — **Falcon Event Streaming**, below.
 
+### 5.1 Group-committed message log
+
+`MessageLog` (`log.rs`) uses the same **group commit** as the KV WAL, and for
+the same reason: fsync is the cost, so batch it. A dedicated background writer
+thread owns the file; `append` assigns an offset, hands the framed bytes to the
+writer over a channel, and blocks until the writer confirms durability. The
+writer drains *every* queued request into one batch, writes them all, and does a
+**single** fsync — so a burst of N concurrent appends costs one fsync, not N.
+Each `append` still returns only once its own bytes are fsynced, so per-message
+durability is unchanged. This took durable pub/sub, queue, and stream appends
+from ~270 ops/sec (one fsync each) to ~4,300 ops/sec (see §9).
+
+Two further points make this effective end-to-end:
+
+- **Non-blocking dispatch.** The wire and REST servers run messaging appends on
+  the blocking pool (`spawn_blocking`), so a slow fsync never stalls the async
+  worker driving other pipelined connections — this was the single biggest win.
+- **Shared cross-partition writer.** All partitions of one stream share a single
+  group-commit writer thread (`SharedWriter`), which fsyncs each *touched*
+  partition file once per drain. On one disk, N partitions still cost N
+  independent fsyncs (inherent — like Kafka), so partition count is an
+  ordering-parallelism-vs-throughput dial; a per-stream `interval_fsync_ms`
+  coalesces fsyncs on a timer to reclaim throughput at a bounded loss window.
+
 ---
 
 ## 6. Falcon Event Streaming
@@ -389,6 +413,32 @@ can allocate. `0` disables the cap.
 - Engines without an ordered log (`file-per-key`, `sharded`) can be replication
   *targets* but not *leaders* — enforced at config validation.
 
+### 8.1 Ordering & catch-up under concurrent writes
+
+Single-leader replication depends on the WAL being **strictly ordered by
+sequence**: the leader streams `read_replog_from(last_sent)` and the follower
+tracks a sequence watermark. Two invariants make that hold under concurrent
+writers (found and fixed via the concurrent `--bench-all`):
+
+- **Atomic sequence + append.** Writes to *different* keys don't share the
+  per-key lock, so two of them can allocate sequence N and N+1 concurrently. If
+  they then enqueued to the WAL in either order, the file order wouldn't match
+  sequence order — and a follower seeking its sparse offset index by sequence
+  could skip records permanently. So sequence allocation and the WAL enqueue are
+  performed together under a short order lock (`WarmEngine::seq_and_submit`);
+  the fsync still happens *outside* it, so group commit batches fully. File
+  order now always equals sequence order.
+- **Safety re-read poll.** The leader's live-tail stream re-reads the log on a
+  new-write wake — but a wake can be missed (broadcast lag, or a write landing
+  between the historical read and the first `recv`). The stream therefore waits
+  on the wake with a short timeout and re-reads on every tick, so a stranded
+  follower always converges within one poll interval. Correctness never depends
+  on the wake; it's only a latency hint.
+
+Both are regression-tested (`falcon-storage/tests/replog_ordering.rs`) and
+verified end-to-end by the multi-region benchmark (400/400 converged, none lost,
+under 16 concurrent writers).
+
 ---
 
 ## 9. Performance & safety principles
@@ -423,9 +473,28 @@ APFS). Reproducible via the commands in the README's Benchmarks section.
 The read path is Redis-class (millions of ops/sec, sub-millisecond tail). The
 write path is a **durability dial**: fsync-every-write guarantees zero
 acked-write loss and is bound by disk fsync latency; `interval_fsync_ms` trades
-a bounded loss window for a ~400× throughput gain. Every sustained test stayed
-`STABLE` (flat throughput, no tail runaway) under saturation. As of this
-writing the workspace has **104 tests across 42 binaries, all green**.
+a bounded loss window for a ~400× throughput gain.
+
+**Every subsystem** (`falcon-bench --bench-all`), durable-write throughput,
+concurrent + pipelined — each run asserts fast/reliable/safe/durable and aborts
+on any failed check:
+
+All numbers are **concurrent** (multi-connection), so they reflect real capacity.
+
+| Subsystem | Concurrent peak | Verified |
+|-----------|----------------:|----------|
+| FalconDB (KV) | ~2,200 ops/sec | 4000/4000 survive hard restart |
+| Falcon Pub/Sub (durable topic) | ~4,600 ops/sec | ordered, persisted |
+| Falcon Queue | ~4,250 ops/sec | at-least-once, no redelivery of acked |
+| Falcon Event Streaming (1 partition) | ~4,300 ops/sec | per-key ordered, durable resume |
+| Realtime DB (32 concurrent subs) | ~2,270 ops/sec | every write notified |
+| Multi-region (16 concurrent writers) | ~940 ops/sec* | 400/400 converged, none lost |
+
+*\* multi-region also reports batch **convergence time** (~1.0–1.3 s for 400
+writes over async gRPC replication) — replication is async, so this is
+convergence, not per-write latency.* Every sustained test stayed `STABLE` (flat
+throughput, no tail runaway) under saturation. As of this writing the workspace
+has **105 tests across 43 binaries, all green**.
 
 ---
 

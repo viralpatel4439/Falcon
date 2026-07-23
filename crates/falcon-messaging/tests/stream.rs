@@ -9,6 +9,7 @@ fn spec(name: &str, partitions: usize) -> StreamSpec {
         name: name.to_string(),
         partitions,
         capacity: 256,
+        interval_fsync_ms: 0,
     }
 }
 

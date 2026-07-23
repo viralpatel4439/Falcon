@@ -13,6 +13,7 @@ fn config_with_stream(dir: &std::path::Path) -> Config {
         name: "events".to_string(),
         partitions: 4,
         capacity: 256,
+        interval_fsync_ms: 0,
     });
     config
 }

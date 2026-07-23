@@ -117,12 +117,28 @@ fn name_str<'a>(bytes: &'a [u8], default: &'a str) -> Option<&'a str> {
     }
 }
 
-async fn dispatch(node: &Node, req: &Request) -> Response {
+async fn dispatch(node: &Arc<Node>, req: &Request) -> Response {
     match req.op {
         OP_PING => Response::Pong,
         OP_GET | OP_SET | OP_DEL => dispatch_kv(node, req).await,
-        OP_PUBLISH | OP_PUSH | OP_POP | OP_ACK => dispatch_messaging(node, req),
-        OP_STREAM_APPEND => dispatch_stream_append(node, req),
+        // Messaging/stream appends fsync a durable log, which blocks. Run them
+        // on the blocking pool so a slow fsync never stalls the async worker
+        // (and other pipelined connections it's driving). The request bytes are
+        // cheap `Bytes` clones.
+        OP_PUBLISH | OP_PUSH | OP_POP | OP_ACK => {
+            let node = node.clone();
+            let req = req.clone();
+            tokio::task::spawn_blocking(move || dispatch_messaging(&node, &req))
+                .await
+                .unwrap_or(Response::ServerError)
+        }
+        OP_STREAM_APPEND => {
+            let node = node.clone();
+            let req = req.clone();
+            tokio::task::spawn_blocking(move || dispatch_stream_append(&node, &req))
+                .await
+                .unwrap_or(Response::ServerError)
+        }
         _ => Response::BadRequest,
     }
 }

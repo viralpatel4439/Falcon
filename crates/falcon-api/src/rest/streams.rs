@@ -73,10 +73,13 @@ pub async fn append(
     Query(params): Query<HashMap<String, String>>,
     body: axum::body::Bytes,
 ) -> Result<Json<AppendResponse>, ApiError> {
-    let s = stream(&state, &name)?;
+    let s = stream(&state, &name)?.clone();
     let key = params.get("key").map(|k| k.as_bytes().to_vec()).unwrap_or_default();
-    let (partition, offset) = s
-        .append_keyed(&key, body.to_vec())
+    let payload = body.to_vec();
+    // The append fsyncs a durable log (blocking); run it off the async worker.
+    let (partition, offset) = tokio::task::spawn_blocking(move || s.append_keyed(&key, payload))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(AppendResponse {
         stream: name,

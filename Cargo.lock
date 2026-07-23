@@ -491,11 +491,14 @@ dependencies = [
  "bytes",
  "clap",
  "falcon-wire",
+ "futures",
  "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-tungstenite 0.24.0",
 ]
 
 [[package]]

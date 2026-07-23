@@ -49,8 +49,16 @@ struct Partition {
 }
 
 impl Partition {
-    fn open(index: usize, path: &Path, capacity: usize) -> Result<Self, MessagingError> {
-        let log = MessageLog::open(path)?;
+    /// Open a partition whose durable log shares `writer` with the stream's
+    /// other partitions, so all partitions coalesce onto one fsync-batching
+    /// thread (one fsync per touched partition file per batch).
+    fn open(
+        index: usize,
+        path: &Path,
+        capacity: usize,
+        writer: &crate::log::SharedWriter,
+    ) -> Result<Self, MessagingError> {
+        let log = MessageLog::open_shared(path, writer)?;
         let (tx, _) = broadcast::channel(capacity.max(16));
         Ok(Self { log, tx, index })
     }
@@ -87,6 +95,10 @@ pub struct Stream {
     /// memory and mirrored to one small file per group under `offsets_dir`.
     groups: Mutex<HashMap<String, GroupCursor>>,
     offsets_dir: PathBuf,
+    /// Shared group-commit writer backing every partition, so a burst across
+    /// partitions fsyncs each touched partition file once — kept alive for the
+    /// lifetime of the stream. `_` because it's held only to own the thread.
+    _writer: std::sync::Arc<crate::log::SharedWriter>,
 }
 
 /// A consumer group's committed offsets, one per partition. `committed[p]` is
@@ -107,13 +119,31 @@ impl Stream {
         data_dir: &Path,
         capacity: usize,
     ) -> Result<Self, MessagingError> {
+        Self::open_with_fsync(name, partitions, data_dir, capacity, 0)
+    }
+
+    /// Open a stream with an explicit interval-fsync policy (ms). `0` =
+    /// fsync-every-append (full durability); `> 0` coalesces fsyncs across all
+    /// partitions onto a timer for much higher throughput at a bounded loss
+    /// window.
+    pub fn open_with_fsync(
+        name: &str,
+        partitions: usize,
+        data_dir: &Path,
+        capacity: usize,
+        interval_fsync_ms: u64,
+    ) -> Result<Self, MessagingError> {
         let n = partitions.max(1);
         let stream_dir = data_dir.join(format!("stream_{name}"));
         std::fs::create_dir_all(&stream_dir)?;
+        // One shared group-commit writer for all partitions of this stream.
+        let writer = std::sync::Arc::new(crate::log::SharedWriter::with_fsync_interval(
+            interval_fsync_ms,
+        ));
         let mut parts = Vec::with_capacity(n);
         for i in 0..n {
             let path = stream_dir.join(format!("partition_{i}.log"));
-            parts.push(Partition::open(i, &path, capacity)?);
+            parts.push(Partition::open(i, &path, capacity, &writer)?);
         }
         let offsets_dir = stream_dir.join("offsets");
         std::fs::create_dir_all(&offsets_dir)?;
@@ -123,6 +153,7 @@ impl Stream {
             partitions: parts,
             groups: Mutex::new(groups),
             offsets_dir,
+            _writer: writer,
         })
     }
 

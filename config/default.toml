@@ -148,6 +148,14 @@ write_mode = "single-leader"  # "single-leader" (default): one region writes,
 #
 # [[stream]]
 # name = "user-events"
-# partitions = 8          # ordering domains / parallelism (min 1). A key is
-#                         # always ordered within its partition.
+# partitions = 1          # ordering domains / parallelism (min 1, default 1). A
+#                         # key is always ordered within its partition. NOTE: on
+#                         # a single disk each partition fsyncs independently, so
+#                         # MORE partitions trade single-node write throughput
+#                         # for parallel ordering (like Kafka). Raise when you
+#                         # need parallel ordering domains or add disks/nodes.
 # capacity = 1024         # live-tail broadcast buffer per partition
+# interval_fsync_ms = 0   # 0 = fsync every append (zero acked-write loss).
+#                         # >0 = coalesce fsyncs across partitions on this
+#                         # interval: higher throughput at a bounded loss window
+#                         # (same dial as the warm KV tier).

@@ -67,6 +67,7 @@ impl Node {
                 name: s.name.clone(),
                 partitions: s.partitions,
                 capacity: s.capacity,
+                interval_fsync_ms: s.interval_fsync_ms,
             })
             .collect();
         let messaging = Arc::new(Messaging::build(

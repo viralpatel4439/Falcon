@@ -1,3 +1,4 @@
+mod subsystems;
 mod target_kvstore;
 mod target_wire;
 mod workload;
@@ -76,11 +77,27 @@ struct Args {
     /// tail latency of the two durability modes.
     #[arg(long, default_value_t = 0)]
     load_interval_fsync_ms: u64,
+
+    /// Run the full-subsystem benchmark suite: KV, pub/sub, queue, event
+    /// streaming, realtime DB, and multi-region replication — each with
+    /// fast/reliable/safe/durable checks. Spawns its own servers.
+    #[arg(long, default_value_t = false)]
+    bench_all: bool,
+
+    /// Record count per subsystem in `--bench-all` (kept modest so the durable
+    /// write phases finish quickly; throughput still meaningful).
+    #[arg(long, default_value_t = 2000)]
+    bench_records: usize,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    if args.bench_all {
+        return run_bench_all(&args).await;
+    }
+
     let workload = Workload::generate(args.key_count, args.value_size);
     let keys = Arc::new(workload.keys);
     let value = Arc::new(workload.value);
@@ -389,4 +406,33 @@ fn tempdir() -> anyhow::Result<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(format!("kv-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Full-subsystem benchmark: every Falcon component, each measured for
+/// throughput/latency AND checked for reliability, safety, and durability.
+/// Any failed correctness check aborts with a non-zero exit — a regression
+/// cannot hide behind a good throughput number.
+async fn run_bench_all(args: &Args) -> anyhow::Result<()> {
+    use subsystems::*;
+
+    println!("========================================================");
+    println!(" Falcon full-subsystem benchmark  (records/subsystem = {})", args.bench_records);
+    println!(" axes: FAST · RELIABLE · SAFE · DURABLE");
+    println!("========================================================\n");
+
+    let n = args.bench_records;
+
+    print_sub(&bench_kv(n, args.value_size).await?);
+    print_sub(&bench_pubsub(n).await?);
+    print_sub(&bench_queue(n).await?);
+    print_sub(&bench_stream(n).await?);
+    // Realtime notify is a round-trip per event; keep the count smaller.
+    print_sub(&bench_realtime((n / 10).max(200)).await?);
+    // Multi-region polls for convergence per write; smaller count.
+    print_sub(&bench_multiregion((n / 10).max(200)).await?);
+
+    println!("========================================================");
+    println!(" ALL SUBSYSTEMS PASSED fast/reliable/safe/durable checks");
+    println!("========================================================");
+    Ok(())
 }

@@ -1,16 +1,24 @@
 # Falcon
 
-A fast, safe, fully-configurable data platform in Rust. Falcon bundles four
+A fast, safe, fully-configurable data platform in Rust. Falcon bundles five
 components behind one binary:
 
-- **FalconDB** — the key-value store
-- **Falcon Queue** — durable work queues
-- **Falcon Pub/Sub** — topics
-- **Falcon Realtime DB** — live WebSocket subscriptions
+- **FalconDB** — the key-value store (six pluggable storage tiers)
+- **Falcon Queue** — durable, at-least-once work queues
+- **Falcon Pub/Sub** — topics (ephemeral or durable)
+- **Falcon Event Streaming** — partitioned, replayable event logs with durable
+  consumer groups (Kafka-shaped)
+- **Falcon Realtime DB** — live WebSocket subscriptions (write→notify)
 
-…plus TTL, multi-region replication (single- and multi-leader), and pluggable
-storage — over HTTP, a lean binary protocol, and WebSockets. Everything optional
-is **off by default and costs nothing when unused**.
+…plus TTL, multi-region replication (single- and multi-leader), pluggable
+storage, Prometheus metrics, WAL compaction, and graceful shutdown — over HTTP,
+a lean binary protocol, and WebSockets. Everything optional is **off by default
+and costs nothing when unused**.
+
+**Every subsystem is benchmarked for *fast · reliable · safe · durable*** with
+`falcon-bench --bench-all` (see [Benchmarks](#benchmarks)) — each run asserts
+correctness (no loss, ordering, survives restart) so a regression can't hide
+behind a good number.
 
 ## What it does
 
@@ -104,6 +112,33 @@ A length-prefixed TCP protocol with pipelining, for high throughput. Ops: `GET`,
 `STREAM_APPEND`, `AUTH`. Send many requests back-to-back and read replies in
 order (no per-op round-trip). See `crates/falcon-wire/src/protocol.rs` for the
 frame layout.
+
+## Concurrency
+
+Every subsystem serves requests with **true concurrency**, verified by the
+`--bench-all` suite (all numbers there are multi-connection):
+
+- **Connections run in parallel.** Each binary-protocol connection is its own
+  Tokio task; the HTTP/WebSocket server (axum) handles every request
+  concurrently. Thousands of clients make progress at once — nothing funnels
+  through a global lock.
+- **Storage is sharded, not globally locked.** Reads hit a concurrent `DashMap`
+  (or sled) with no lock; writes take only a *per-key* lock (a 1024-way sharded
+  lock table), so writes to different keys proceed fully in parallel.
+- **Durability batches instead of serializing.** The KV WAL and the messaging
+  log both use **group commit** — a background writer coalesces many concurrent
+  writes into one fsync — so durable throughput *scales with* concurrency
+  instead of pinning at one-fsync-at-a-time. Messaging fsyncs run on the
+  blocking pool so a slow disk never stalls the async workers.
+- **Ordering is preserved under concurrency.** Sequence assignment and the WAL
+  append are atomic, so the replication log a follower streams is strictly
+  ordered even when unrelated keys are written in parallel (regression-tested).
+- **Streams parallelize by partition.** Different partitions are independent
+  ordering domains written in parallel; a single key stays totally ordered.
+
+The one deliberate exception: ops **pipelined on a single connection** are
+dispatched in arrival order (Redis-like per-connection ordering). Concurrency
+comes from using multiple connections — which real clients and the benchmark do.
 
 ## Pub/Sub and queues
 
@@ -279,11 +314,68 @@ small bounded loss window for a ~400× throughput jump.
 queue buildup)` — throughput held flat under 64-connection saturation with no
 tail runaway.
 
+### Every subsystem (`--bench-all`)
+
+`falcon-bench --bench-all` spawns real servers and benchmarks **every**
+component, and each run **asserts correctness on four axes — a failed check
+aborts the run**, so these numbers can't hide a regression:
+
+- **FAST** — throughput / latency
+- **RELIABLE** — stable under load; a slow consumer never loses or reorders
+- **SAFE** — no errors; every accepted op accounted for
+- **DURABLE** — data survives a hard process restart (verified by killing the
+  server and re-reading)
+
+Durable-write throughput, concurrent + pipelined (same dev Mac):
+
+All numbers are **concurrent** (many connections/writers at once), not
+single-threaded, so they reflect real capacity:
+
+| Subsystem | Concurrent peak | Correctness verified |
+|-----------|----------------:|----------------------|
+| **FalconDB** (KV, durable) | ~2,200 ops/sec | 4000/4000 survived a hard restart |
+| **Falcon Pub/Sub** (durable topic) | **~4,600 ops/sec** | ordered, persisted across restart |
+| **Falcon Queue** (at-least-once) | **~4,250 ops/sec** | all delivered, acked jobs not redelivered |
+| **Falcon Event Streaming** (1 partition) | **~4,300 ops/sec** | per-key ordered, durable commit/resume |
+| **Falcon Realtime DB** (32 concurrent subs) | **~2,270 ops/sec** | every write notified its subscriber |
+| **Multi-region** (16 concurrent writers) | ~940 ops/sec¹ | 400/400 converged, none lost |
+
+¹ *Multi-region also reports **cross-region convergence time** — how long the
+whole concurrent batch takes to appear on the follower (~1.0–1.3 s for 400
+writes over async gRPC replication). Replication is async by design; the number
+is convergence, not per-write latency.*
+
+> **A real bug this caught.** Writing the concurrent multi-region benchmark
+> surfaced a genuine data-loss bug: under a burst of concurrent writes to
+> *different* keys, sequence allocation and the WAL append weren't atomic, so
+> the on-disk log order didn't match sequence order — which stranded a
+> follower's log catch-up and silently dropped writes. Fixed by making
+> sequence-assign + WAL-enqueue atomic (file order == sequence order) and adding
+> a safety re-read poll to the leader's replication stream. Regression-tested in
+> `crates/falcon-storage/tests/replog_ordering.rs`.
+
+Two engine-level fixes got messaging here (durable pub/sub, queue, and stream
+appends were previously fsync-bound at **~270 ops/sec — a ~16× improvement**):
+
+1. **Group commit for the message log** — a background writer drains all queued
+   appends and does one fsync per batch (the same design as the KV WAL).
+2. **Non-blocking dispatch** — messaging fsyncs run on the blocking pool so a
+   slow disk never stalls the async workers driving other connections.
+
+**Stream partitions are an ordering-parallelism-vs-throughput dial:** on a
+single disk each partition fsyncs independently, so fewer partitions = higher
+single-node throughput (1 partition ≈ 4,400/sec; 8 partitions ≈ 2,300/sec) —
+the same property Kafka has. Default is 1; raise it for parallel ordering
+domains, and use a stream's `interval_fsync_ms` to trade a bounded loss window
+for throughput at higher partition counts.
+
 Reproduce:
 
 ```bash
 cargo build --release -p falcon-cli -p falcon-bench
-# Throughput + latency percentiles (HTTP baseline + pipelined wire):
+# Every subsystem, with fast/reliable/safe/durable checks:
+./target/release/falcon-bench --bench-all
+# KV throughput + latency percentiles (HTTP baseline + pipelined wire):
 ./target/release/falcon-bench --pipeline-depths 1,16,128
 # Sustained read load:
 ./target/release/falcon-bench --load-test --load-secs 15 --load-conns 64 --load-write-ratio 0.0
