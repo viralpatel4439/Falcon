@@ -30,8 +30,8 @@ pub enum NodeError {
     UnknownKeyspace(String),
     #[error("tier '{0}' is not available in this build (rebuild with the 'cold' feature)")]
     TierNotCompiled(&'static str),
-    #[error("S3 storage backend is not available in this build (rebuild with the 's3' feature)")]
-    S3NotCompiled,
+    #[error("remote storage backend is not available in this build (rebuild with the 'remote' feature)")]
+    RemoteNotCompiled,
 }
 
 impl Node {
@@ -320,9 +320,10 @@ fn build_keyspace(
 }
 
 /// Build a `sharded` keyspace's engine over the configured backend: a local
-/// directory (default) or any S3-compatible object store. The sharded tier is
-/// backend-agnostic — it addresses a fixed set of bucket objects through the
-/// `ObjectStore` trait, so attaching third-party storage is just a config swap.
+/// directory (default) or an operator-specified third-party object store. The
+/// sharded tier is backend-agnostic — it addresses a fixed set of bucket
+/// objects through the `ObjectStore` trait, so attaching remote storage is just
+/// a config swap.
 fn build_sharded_engine(
     ks_cfg: &KeyspaceConfig,
     config: &Config,
@@ -339,30 +340,32 @@ fn build_sharded_engine(
                 policy,
             )?)
         }
-        #[cfg(feature = "s3")]
-        StorageBackend::S3(s3) => {
+        #[cfg(feature = "remote")]
+        StorageBackend::Remote(r) => {
             // Give each keyspace its own object-name prefix so many keyspaces
             // can share a single bucket without colliding.
-            let prefix = if s3.prefix.is_empty() {
+            let prefix = if r.prefix.is_empty() {
                 format!("falcon/{}", ks_cfg.name)
             } else {
-                format!("{}/{}", s3.prefix.trim_end_matches('/'), ks_cfg.name)
+                format!("{}/{}", r.prefix.trim_end_matches('/'), ks_cfg.name)
             };
-            let store = Arc::new(falcon_storage::S3Store::new(falcon_storage::S3Config {
-                endpoint_url: s3.endpoint_url.clone(),
-                region: s3.region.clone(),
-                bucket: s3.bucket.clone(),
-                access_key_id: s3.access_key_id.clone(),
-                secret_access_key: s3.secret_access_key.clone(),
-                prefix,
-            })?);
+            let store = Arc::new(falcon_storage::RemoteObjectStore::new(
+                falcon_storage::RemoteConfig {
+                    endpoint_url: r.endpoint_url.clone(),
+                    region: r.region.clone(),
+                    bucket: r.bucket.clone(),
+                    access_key_id: r.access_key_id.clone(),
+                    secret_access_key: r.secret_access_key.clone(),
+                    prefix,
+                },
+            )?);
             Ok(falcon_storage::ShardedObjectStore::with_store(
                 store,
                 ks_cfg.shard_buckets,
                 policy,
             )?)
         }
-        #[cfg(not(feature = "s3"))]
-        StorageBackend::S3(_) => Err(NodeError::S3NotCompiled),
+        #[cfg(not(feature = "remote"))]
+        StorageBackend::Remote(_) => Err(NodeError::RemoteNotCompiled),
     }
 }

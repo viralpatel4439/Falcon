@@ -27,11 +27,31 @@ pub struct Keyspace {
     /// Set for multi-leader keyspaces: HLC clock + a concrete warm-engine
     /// handle for the LWW write path. `None` = single-leader (default).
     multi_leader: Option<MultiLeader>,
+    /// Set on a NON-primary node in primary-queue mode: forwards a client
+    /// write to the primary region (which commits it in one ordered queue and
+    /// streams it back). `None` = write locally (primary node, or other modes).
+    forwarder: std::sync::RwLock<Option<Arc<dyn WriteForwarder>>>,
 }
 
 struct MultiLeader {
     clock: HlcClock,
     warm: Arc<WarmEngine>,
+}
+
+/// A write forwarded to the primary in `primary-queue` mode. The forwarder
+/// sends it over the replication channel and returns the committed sequence
+/// the primary assigned. The committed change then arrives back on this node
+/// via the normal replication stream (which is what actually mutates local
+/// storage), so forwarding does NOT write locally.
+#[async_trait::async_trait]
+pub trait WriteForwarder: Send + Sync {
+    async fn forward_put(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl_secs: Option<u64>,
+    ) -> Result<Sequence, StorageError>;
+    async fn forward_delete(&self, key: &[u8]) -> Result<Sequence, StorageError>;
 }
 
 impl Keyspace {
@@ -50,7 +70,19 @@ impl Keyspace {
             expiry: DashMap::new(),
             default_ttl_ms: (default_ttl_secs as u128) * 1000,
             multi_leader: None,
+            forwarder: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Install the primary-queue forwarder (called by the replication layer on
+    /// a non-primary node). Once set, client writes are forwarded to the
+    /// primary instead of applied locally.
+    pub fn set_forwarder(&self, forwarder: Arc<dyn WriteForwarder>) {
+        *self.forwarder.write().unwrap() = Some(forwarder);
+    }
+
+    fn forwarder(&self) -> Option<Arc<dyn WriteForwarder>> {
+        self.forwarder.read().unwrap().clone()
     }
 
     /// Enable multi-leader (active-active) writes: local writes are stamped
@@ -125,6 +157,13 @@ impl Keyspace {
         value: &[u8],
         ttl_secs: Option<u64>,
     ) -> Result<Sequence, StorageError> {
+        // Primary-queue (non-primary node): forward to the primary, which
+        // commits in one ordered queue. The committed change comes back over
+        // the replication stream and mutates local storage there — so we do
+        // NOT write locally here, avoiding a lost/dropped concurrent write.
+        if let Some(fwd) = self.forwarder() {
+            return fwd.forward_put(key, value, ttl_secs).await;
+        }
         // Multi-leader: stamp a fresh HLC and write via the LWW path so this
         // write carries an ordering that converges across regions.
         let (seq, hlc) = match &self.multi_leader {
@@ -149,6 +188,10 @@ impl Keyspace {
     }
 
     pub async fn delete(&self, key: &[u8]) -> Result<Sequence, StorageError> {
+        // Primary-queue (non-primary node): forward the delete to the primary.
+        if let Some(fwd) = self.forwarder() {
+            return fwd.forward_delete(key).await;
+        }
         let (seq, hlc) = match &self.multi_leader {
             Some(ml) => {
                 let hlc = ml.clock.now();

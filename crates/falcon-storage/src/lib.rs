@@ -6,8 +6,8 @@ mod engine;
 mod hot;
 mod lock_table;
 mod object_store;
-#[cfg(feature = "s3")]
-mod s3_store;
+#[cfg(feature = "remote")]
+mod remote_store;
 mod sharded_store;
 #[cfg(feature = "cold")]
 mod tiered;
@@ -21,8 +21,8 @@ pub use engine::{StorageEngine, StorageError, StorageTier};
 pub use hot::HotEngine;
 pub use lock_table::KeyLockTable;
 pub use object_store::{LocalDirStore, ObjectStore};
-#[cfg(feature = "s3")]
-pub use s3_store::{S3Config, S3Store};
+#[cfg(feature = "remote")]
+pub use remote_store::{RemoteConfig, RemoteObjectStore};
 pub use sharded_store::{FlushPolicy, ShardedObjectStore};
 #[cfg(feature = "cold")]
 pub use tiered::{TierStats, TieredEngine};

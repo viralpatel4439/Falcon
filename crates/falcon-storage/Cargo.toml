@@ -6,13 +6,13 @@ license.workspace = true
 
 [features]
 # Default keeps every backend so the `full` build is unchanged.
-default = ["cold", "s3"]
+default = ["cold", "remote"]
 # `cold` pulls sled (the on-disk cold tier, and the tiered tier that layers a
 # RAM working set over it). A build that needs neither omits sled entirely.
 cold = ["dep:sled"]
-# `s3` pulls the S3-compatible object-store backend and its signing deps. Only
-# compiled when a build actually wants remote third-party storage.
-s3 = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:hex", "dep:urlencoding", "dep:time"]
+# `remote` pulls the third-party object-store backend and its signing deps.
+# Only compiled when a build actually wants remote storage.
+remote = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:hex", "dep:urlencoding", "dep:time"]
 
 [dependencies]
 falcon-events = { workspace = true }
@@ -24,8 +24,8 @@ serde = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 sled = { workspace = true, optional = true }
-# S3 backend (feature = "s3"): a minimal SigV4 signer over reqwest so any
-# S3-compatible endpoint works without a heavy SDK.
+# Remote backend (feature = "remote"): a minimal SigV4 signer over reqwest so any
+# object store works without a heavy SDK.
 reqwest = { version = "0.12", features = ["blocking"], optional = true }
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }

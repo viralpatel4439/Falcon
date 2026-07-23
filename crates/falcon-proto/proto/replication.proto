@@ -11,6 +11,31 @@ service Replication {
 
   // Handshake: follower announces itself, leader confirms role + current sequence.
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+
+  // Primary-queue write mode: a non-primary region forwards a client write to
+  // the primary, which enqueues it into its single ordered write path, commits
+  // it durably, and returns the assigned sequence. The committed change then
+  // reaches every region over StreamChanges — so no concurrent write is ever
+  // dropped (unlike multi-leader last-write-wins).
+  rpc ForwardWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
+}
+
+message ForwardWriteRequest {
+  string keyspace = 1;
+  bytes key = 2;
+  oneof value {
+    bytes put_value = 3;
+    bool tombstone = 4;
+  }
+  // Origin region, for observability / loop-avoidance.
+  string origin_region = 5;
+  // Optional TTL seconds for a put (0 = none).
+  uint64 ttl_secs = 6;
+}
+
+message ForwardWriteResponse {
+  // The sequence the primary assigned after committing the write durably.
+  uint64 sequence = 1;
 }
 
 message StreamChangesRequest {

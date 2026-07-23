@@ -48,10 +48,23 @@ pub async fn start(node: Arc<Node>) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Primary-queue keyspaces: the leader is the primary (accepts forwarded
+    // writes + streams the committed log); a follower installs a forwarder so
+    // its local client writes go to the primary and come back via the stream.
+    let primary_queue_keyspaces: Vec<String> = config
+        .keyspaces
+        .iter()
+        .filter(|ks| ks.replication && ks.write_mode == WriteMode::PrimaryQueue)
+        .map(|ks| ks.name.clone())
+        .collect();
+
     match config.replication.role {
         ReplicationRole::Leader => start_leader(&node, &config, &replicated_keyspaces).await,
         ReplicationRole::Follower => {
             start_follower(&node, &config, &replicated_keyspaces).await;
+            if !primary_queue_keyspaces.is_empty() {
+                install_primary_forwarders(&node, &config, &primary_queue_keyspaces);
+            }
             Ok(())
         }
     }
@@ -103,6 +116,7 @@ async fn start_leader(
     config: &falcon_core::Config,
     keyspaces: &[String],
 ) -> anyhow::Result<()> {
+    use falcon_core::WriteMode;
     let mut sources = HashMap::new();
     for name in keyspaces {
         let ks = node
@@ -114,19 +128,70 @@ async fn start_leader(
             .events()
             .cloned()
             .expect("replicated keyspace must have an event bus (enabled at Node::build)");
+
+        // In primary-queue mode this leader is the primary: accept forwarded
+        // writes and commit them through the keyspace's normal ordered path,
+        // so they join the same single-writer queue as local writes (total
+        // order, no lost concurrent write). The committed change then streams
+        // to every region via the log above.
+        let is_primary_queue = config
+            .keyspaces
+            .iter()
+            .any(|k| k.name == *name && k.write_mode == WriteMode::PrimaryQueue);
+        let apply_forwarded: Option<falcon_replication::ForwardApplyFn> = if is_primary_queue {
+            let apply_node = node.clone();
+            let ks_name = name.clone();
+            Some(std::sync::Arc::new(move |w: falcon_replication::ForwardedWrite| {
+                let node = apply_node.clone();
+                let ks_name = ks_name.clone();
+                Box::pin(async move {
+                    let ks = node
+                        .keyspace(&ks_name)
+                        .ok_or_else(|| "unknown keyspace".to_string())?;
+                    let seq = match w.value {
+                        Some(v) => {
+                            let ttl = (w.ttl_secs != 0).then_some(w.ttl_secs);
+                            ks.put_with_ttl(&w.key, &v, ttl)
+                                .await
+                                .map_err(|e| e.to_string())?
+                        }
+                        None => ks.delete(&w.key).await.map_err(|e| e.to_string())?,
+                    };
+                    Ok(seq)
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, String>> + Send>>
+            }))
+        } else {
+            None
+        };
+
         sources.insert(
             name.clone(),
-            KeyspaceReplicationSource { log_reader, events },
+            KeyspaceReplicationSource {
+                log_reader,
+                events,
+                apply_forwarded,
+            },
         );
     }
 
     let server_impl = ReplicationServerImpl::new(config.node.id.clone(), sources)
         .with_auth_token(config.auth.api_key.clone());
     let bind: std::net::SocketAddr = config.replication.grpc_bind.parse()?;
-    tracing::info!(%bind, "replication gRPC server (leader) listening");
+
+    // Optional transport TLS for cross-region service↔service traffic.
+    let mut builder = Server::builder();
+    if config.tls.is_enabled() {
+        let cert = std::fs::read(&config.tls.cert_file)?;
+        let key = std::fs::read(&config.tls.key_file)?;
+        let identity = tonic::transport::Identity::from_pem(cert, key);
+        builder = builder.tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?;
+        tracing::info!(%bind, "replication gRPC server (leader) listening [TLS]");
+    } else {
+        tracing::info!(%bind, "replication gRPC server (leader) listening");
+    }
 
     tokio::spawn(async move {
-        if let Err(e) = Server::builder()
+        if let Err(e) = builder
             .add_service(falcon_proto::replication::replication_server::ReplicationServer::new(
                 server_impl,
             ))
@@ -138,6 +203,35 @@ async fn start_leader(
     });
 
     Ok(())
+}
+
+/// On a non-primary node, point each primary-queue keyspace's forwarder at the
+/// primary (the configured `leader_addr`). Client writes to these keyspaces are
+/// then forwarded to the primary and applied there in one ordered queue.
+fn install_primary_forwarders(
+    node: &Arc<Node>,
+    config: &falcon_core::Config,
+    keyspaces: &[String],
+) {
+    let primary_addr = match &config.replication.leader_addr {
+        Some(addr) if !addr.is_empty() => addr.clone(),
+        _ => {
+            tracing::error!("primary-queue follower has no leader_addr; writes cannot be forwarded");
+            return;
+        }
+    };
+    for name in keyspaces {
+        if let Some(ks) = node.keyspace(name) {
+            let forwarder = std::sync::Arc::new(falcon_replication::PrimaryForwarder::new(
+                primary_addr.clone(),
+                name.clone(),
+                config.node.region.clone(),
+                config.auth.api_key.clone(),
+            ));
+            ks.set_forwarder(forwarder);
+            tracing::info!(keyspace = %name, primary = %primary_addr, "primary-queue: forwarding writes to primary");
+        }
+    }
 }
 
 async fn start_follower(node: &Arc<Node>, config: &falcon_core::Config, keyspaces: &[String]) {

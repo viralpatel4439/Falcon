@@ -32,13 +32,18 @@ dashmap = "6"
 bytes = "1"
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 tonic-build = "0.12"
 prost = "0.13"
 sled = "0.34"
 clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
 tokio-stream = "0.1"
+# Transport TLS (rustls: pure-Rust, AES-NI accelerated). Shared across hops.
+# `ring` is the crypto provider; installed once at process start.
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
 
 falcon-events = { path = "crates/falcon-events" }
 falcon-storage = { path = "crates/falcon-storage", default-features = false }

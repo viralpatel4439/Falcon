@@ -187,10 +187,74 @@ pub async fn serve_with_shutdown<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    // Load TLS once (shared loader) before building the app so a cert error
+    // fails fast at startup rather than mid-serve.
+    let tls = falcon_core::tls::load_server_config(&node.config().tls)?;
     let app = router_for(node, features, profile_path);
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    tracing::info!(%bind, "HTTP/WebSocket server listening (graceful shutdown enabled)");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
+    match tls {
+        None => {
+            tracing::info!(%bind, "HTTP/WebSocket server listening (graceful shutdown enabled)");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await
+        }
+        Some(tls) => {
+            tracing::info!(%bind, "HTTPS/WSS server listening [TLS] (graceful shutdown enabled)");
+            serve_tls(listener, app, tls, shutdown).await
+        }
+    }
+}
+
+/// Serve the axum app over rustls. Each accepted TCP connection is TLS-wrapped
+/// with `tokio-rustls`, then handed to hyper with HTTP/1 + HTTP/2 auto-detect.
+/// The TLS handshake is per-connection (Falcon uses persistent connections), so
+/// the per-request cost is just AES-NI-accelerated record encryption (µs).
+async fn serve_tls<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    tls: std::sync::Arc<rustls::ServerConfig>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use tower::Service;
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        let (stream, _peer) = tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                Err(e) => { tracing::warn!(error = %e, "accept failed"); continue; }
+            },
+        };
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(error = %e, "TLS handshake failed");
+                    return;
+                }
+            };
+            // Adapt the tower Service (axum Router) into a hyper service.
+            let svc = hyper::service::service_fn(move |req| {
+                let mut app = app.clone();
+                async move { app.call(req).await }
+            });
+            if let Err(e) = ConnBuilder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(TokioIo::new(tls_stream), svc)
+                .await
+            {
+                tracing::debug!(error = %e, "TLS connection error");
+            }
+        });
+    }
+    Ok(())
 }

@@ -38,8 +38,16 @@ where
     F: std::future::Future<Output = ()>,
 {
     let listener = TcpListener::bind(bind).await?;
+    // Optional transport TLS (shared loader). Persistent connections make the
+    // handshake a one-time per-connection cost; per-op stays fast.
+    let tls = falcon_core::tls::load_server_config(&node.config().tls)?
+        .map(tokio_rustls::TlsAcceptor::from);
     if let Ok(addr) = listener.local_addr() {
-        tracing::info!(bind = %addr, "binary wire server listening (graceful shutdown enabled)");
+        if tls.is_some() {
+            tracing::info!(bind = %addr, "binary wire server listening [TLS] (graceful shutdown enabled)");
+        } else {
+            tracing::info!(bind = %addr, "binary wire server listening (graceful shutdown enabled)");
+        }
     }
     tokio::pin!(shutdown);
     loop {
@@ -54,9 +62,22 @@ where
                     tracing::debug!(?e, "failed to set TCP_NODELAY");
                 }
                 let node = node.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = conn::handle_conn(node, stream).await {
-                        tracing::debug!(?e, "wire connection ended with error");
+                    match tls {
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                if let Err(e) = conn::handle_conn(node, tls_stream).await {
+                                    tracing::debug!(?e, "wire connection ended with error");
+                                }
+                            }
+                            Err(e) => tracing::debug!(?e, "wire TLS handshake failed"),
+                        },
+                        None => {
+                            if let Err(e) = conn::handle_conn(node, stream).await {
+                                tracing::debug!(?e, "wire connection ended with error");
+                            }
+                        }
                     }
                 });
             }

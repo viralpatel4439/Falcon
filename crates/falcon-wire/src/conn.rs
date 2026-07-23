@@ -8,9 +8,7 @@ use crate::protocol::{
 use bytes::BytesMut;
 use falcon_core::Node;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::tcp::OwnedWriteHalf;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 
 const BUF_CAPACITY: usize = 64 * 1024;
 const DEFAULT_KEYSPACE: &str = "default";
@@ -26,8 +24,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub async fn handle_conn(node: Arc<Node>, stream: TcpStream) -> std::io::Result<()> {
-    let (read_half, write_half) = stream.into_split();
+/// Handle one connection over any byte stream — a plain `TcpStream` or a
+/// `tokio_rustls` TLS stream. Generic so the wire protocol runs identically
+/// with or without transport encryption.
+pub async fn handle_conn<S>(node: Arc<Node>, stream: S) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::with_capacity(BUF_CAPACITY, read_half);
     let mut writer = BufWriter::with_capacity(BUF_CAPACITY, write_half);
     let mut in_buf = BytesMut::with_capacity(BUF_CAPACITY);
@@ -248,11 +252,14 @@ fn dispatch_messaging(node: &Node, req: &Request) -> Response {
 /// published to the topic from now on as `Message` frames until the client
 /// disconnects. (Durable replay-from-offset can be layered on later via a
 /// flag; this delivers the live tail, which is the low-latency path.)
-async fn run_subscription(
+async fn run_subscription<W>(
     node: &Node,
     req: &Request,
-    mut writer: BufWriter<OwnedWriteHalf>,
-) -> std::io::Result<()> {
+    mut writer: BufWriter<W>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let name = match std::str::from_utf8(&req.keyspace) {
         Ok(s) => s.to_string(),
         Err(_) => return Ok(()),

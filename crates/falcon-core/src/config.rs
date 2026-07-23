@@ -25,6 +25,32 @@ fn default_region() -> String {
     "local".to_string()
 }
 
+/// Optional transport TLS, shared by every server hop (HTTP, wire, gRPC). When
+/// enabled, all three listen with TLS so client↔service, service↔service, and
+/// service↔client traffic is encrypted end to end. Off by default (zero cost).
+///
+/// TLS is terminated *in process* with rustls (pure-Rust, AES-NI accelerated),
+/// so on persistent connections — which Falcon uses everywhere — the handshake
+/// is a one-time per-connection cost and per-record encryption adds only single
+/// -digit microseconds, keeping the per-op hot path fast.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// PEM certificate chain file path.
+    #[serde(default)]
+    pub cert_file: String,
+    /// PEM private key file path.
+    #[serde(default)]
+    pub key_file: String,
+}
+
+impl TlsConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled && !self.cert_file.is_empty() && !self.key_file.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HttpConfig {
     #[serde(default = "default_http_bind")]
@@ -111,7 +137,8 @@ pub struct StorageConfig {
     #[serde(default = "default_max_value_bytes")]
     pub max_value_bytes: usize,
     /// Where a `sharded` keyspace stores its bucket objects. `local` (default)
-    /// uses `data_dir`; `s3` attaches any S3-compatible third-party store.
+    /// uses `data_dir`; `remote` attaches a third-party object store the user
+    /// fully specifies (endpoint + credentials — no defaults).
     #[serde(default)]
     pub backend: StorageBackend,
 }
@@ -127,40 +154,47 @@ impl Default for StorageConfig {
     }
 }
 
-/// The backing store for the `sharded` object-store tier. `local` writes bucket
-/// objects under `data_dir`; `s3` writes them to any S3-compatible endpoint
-/// (AWS S3, MinIO, Cloudflare R2, Backblaze B2, …) so you can attach essentially
-/// any third-party object storage by URL + credentials.
+/// The backing store for the `sharded` object-store tier.
+///
+/// There are exactly two kinds:
+/// - `local` — bucket objects live under the node's `data_dir` on local disk.
+/// - `remote` — a third-party object store the operator fully specifies. Falcon
+///   ships **no defaults** for it: you provide the endpoint and everything
+///   needed to authenticate a request. The wire format is the standard object
+///   HTTP API (S3-compatible), which is what these stores actually speak, so
+///   one `remote` config reaches any provider by URL + credentials.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum StorageBackend {
     #[default]
     Local,
-    S3(S3BackendConfig),
+    Remote(RemoteBackendConfig),
 }
 
-/// Connection details for an S3-compatible object store.
+/// Connection details for a third-party object store. Every field is supplied
+/// by the operator — there are **no built-in defaults**. `region` may be empty
+/// for stores that don't use one.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct S3BackendConfig {
-    /// Base endpoint URL, e.g. `https://s3.amazonaws.com`,
-    /// `http://localhost:9000` (MinIO), or a provider-specific host.
+pub struct RemoteBackendConfig {
+    /// Base endpoint URL of the store (required), e.g. the bucket host you were
+    /// given by your provider or self-hosted gateway.
     #[serde(default)]
     pub endpoint_url: String,
-    #[serde(default = "default_s3_region")]
+    /// Region label used when signing, if the store requires one (else empty).
+    #[serde(default)]
     pub region: String,
+    /// Bucket / container name (required).
     #[serde(default)]
     pub bucket: String,
+    /// Access key id / account identifier used to sign requests (required).
     #[serde(default)]
     pub access_key_id: String,
+    /// Secret key used to sign requests (required).
     #[serde(default)]
     pub secret_access_key: String,
     /// Optional key prefix so multiple keyspaces can share one bucket.
     #[serde(default)]
     pub prefix: String,
-}
-
-fn default_s3_region() -> String {
-    "us-east-1".to_string()
 }
 
 fn default_data_dir() -> String {
@@ -348,9 +382,13 @@ pub struct KeyspaceConfig {
     pub interval_fsync_ms: u64,
     /// Write model. `single-leader` (default): one region writes, others
     /// replicate — strong ordering. `multi-leader`: any region accepts
-    /// writes, converging via HLC last-write-wins — eventual consistency,
-    /// concurrent same-key writes resolve deterministically (one wins).
-    /// Requires a durable tier (warm) and replication enabled.
+    /// writes, converging via HLC last-write-wins — eventual consistency;
+    /// concurrent same-key writes resolve deterministically (one wins, the
+    /// other is dropped). `primary-queue`: any region *accepts* writes but
+    /// forwards them to one primary, which commits them in a single ordered
+    /// queue and streams the committed log to every region — **no concurrent
+    /// write is ever lost**, at the cost of a cross-region hop for non-primary
+    /// writers. All non-single modes require a durable tier (warm) + replication.
     #[serde(default = "default_write_mode")]
     pub write_mode: WriteMode,
 }
@@ -360,6 +398,7 @@ pub struct KeyspaceConfig {
 pub enum WriteMode {
     SingleLeader,
     MultiLeader,
+    PrimaryQueue,
 }
 
 fn default_write_mode() -> WriteMode {
@@ -468,6 +507,8 @@ pub struct Config {
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
+    pub tls: TlsConfig,
+    #[serde(default)]
     pub http: HttpConfig,
     #[serde(default)]
     pub wire: WireConfig,
@@ -498,6 +539,7 @@ impl Default for Config {
         Self {
             node: NodeConfig::default(),
             auth: AuthConfig::default(),
+            tls: TlsConfig::default(),
             http: HttpConfig::default(),
             wire: WireConfig::default(),
             replication: ReplicationConfig::default(),
@@ -528,6 +570,8 @@ pub enum ConfigError {
     RemovedFilePerKey,
     #[error("keyspace '{keyspace}': tier '{tier}' needs the 'cold' build feature (sled) — rebuild with it, or use a different tier")]
     TierNotCompiled { keyspace: String, tier: &'static str },
+    #[error("remote storage backend is missing required field '{0}' (set it with `falcon config set`)")]
+    RemoteStorageMissingField(&'static str),
     #[error("failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
     #[error("io error reading config: {0}")]
@@ -536,10 +580,9 @@ pub enum ConfigError {
 
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
-        // The `file-per-key` tier was removed — it cost one object/request per
-        // key, expensive on third-party object stores. The `sharded` tier
-        // replaces it (fixed object count, works identically on local disk and
-        // remote buckets). Give a clear message instead of a cryptic serde one.
+        // The `file-per-key` tier was removed; the `sharded` tier replaces it
+        // (fixed object count, works identically on local disk and remote
+        // buckets). Give a clear message instead of a cryptic serde one.
         if s.contains("file-per-key") || s.contains("fileperkey") {
             return Err(ConfigError::RemovedFilePerKey);
         }
@@ -575,8 +618,8 @@ impl Config {
             {
                 return Err(ConfigError::ShardedReplicationLeader(ks.name.clone()));
             }
-            if ks.write_mode == WriteMode::MultiLeader {
-                // HLC persistence is wired for the warm tier only.
+            if matches!(ks.write_mode, WriteMode::MultiLeader | WriteMode::PrimaryQueue) {
+                // Both need the durable warm tier and replication enabled.
                 if ks.tier != TierName::Warm {
                     return Err(ConfigError::MultiLeaderTier(ks.name.clone()));
                 }
@@ -590,6 +633,21 @@ impl Config {
             && self.replication.leader_addr.as_deref().unwrap_or("").is_empty()
         {
             return Err(ConfigError::MissingLeaderAddr);
+        }
+        // A remote storage backend must be fully specified — no defaults.
+        if let StorageBackend::Remote(r) = &self.storage.backend {
+            if r.endpoint_url.is_empty() {
+                return Err(ConfigError::RemoteStorageMissingField("endpoint_url"));
+            }
+            if r.bucket.is_empty() {
+                return Err(ConfigError::RemoteStorageMissingField("bucket"));
+            }
+            if r.access_key_id.is_empty() {
+                return Err(ConfigError::RemoteStorageMissingField("access_key_id"));
+            }
+            if r.secret_access_key.is_empty() {
+                return Err(ConfigError::RemoteStorageMissingField("secret_access_key"));
+            }
         }
         Ok(())
     }

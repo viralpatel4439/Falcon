@@ -66,26 +66,29 @@ pub fn install(profile_flag: &Option<String>, args: InstallArgs) -> Result<()> {
     if let Some(v) = args.leader_addr {
         profile.set("leader-addr", &v)?;
     }
+    if let Some(v) = args.write_mode {
+        profile.set("write-mode", &v)?;
+    }
     if !args.peers.is_empty() {
         profile.set("peers", &args.peers.join(","))?;
     }
     if let Some(v) = args.storage {
         profile.set("storage.backend", &v)?;
     }
-    if let Some(v) = args.s3_url {
-        profile.set("s3-url", &v)?;
+    if let Some(v) = args.remote_url {
+        profile.set("remote-url", &v)?;
     }
-    if let Some(v) = args.s3_region {
-        profile.set("s3-region", &v)?;
+    if let Some(v) = args.remote_region {
+        profile.set("remote-region", &v)?;
     }
-    if let Some(v) = args.s3_bucket {
-        profile.set("s3-bucket", &v)?;
+    if let Some(v) = args.remote_bucket {
+        profile.set("remote-bucket", &v)?;
     }
-    if let Some(v) = args.s3_access_key {
-        profile.set("s3-access-key", &v)?;
+    if let Some(v) = args.remote_access_key {
+        profile.set("remote-access-key", &v)?;
     }
-    if let Some(v) = args.s3_secret_key {
-        profile.set("s3-secret-key", &v)?;
+    if let Some(v) = args.remote_secret_key {
+        profile.set("remote-secret-key", &v)?;
     }
 
     profile.save(&path).with_context(|| format!("writing {}", path.display()))?;

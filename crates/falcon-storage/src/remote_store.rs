@@ -1,15 +1,13 @@
-//! An [`ObjectStore`] backed by any S3-compatible endpoint.
+//! An [`ObjectStore`] backed by a third-party object store the operator points
+//! Falcon at. There are no provider defaults — you supply the endpoint and
+//! everything needed to authenticate a request.
 //!
-//! S3's HTTP API is the de-facto standard for object storage, so a single
-//! S3-compatible client lets Falcon attach to essentially any provider —
-//! AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean Spaces,
-//! Ceph, and self-hosted gateways — by pointing `endpoint_url` at it. No
-//! provider-specific code: you bring a URL, region, bucket, and credentials.
-//!
-//! The client is a small AWS Signature V4 signer over `reqwest` (path-style
-//! addressing, which every S3-compatible store accepts). This keeps the
-//! dependency footprint minimal and is gated behind the `s3` cargo feature, so
-//! a build that doesn't use remote storage never compiles it.
+//! The object HTTP API (as popularized by S3) is the de-facto standard these
+//! stores speak, so one client reaches any of them — managed or self-hosted —
+//! by URL + credentials. The client is a small Signature-V4 signer over
+//! `reqwest` (path-style addressing, universally accepted), gated behind the
+//! `remote` cargo feature so a build that doesn't use remote storage never
+//! compiles it.
 //!
 //! Objects are stored under an optional key `prefix`; the sharded tier layers
 //! its bucket objects on top, so one Falcon keyspace maps to a fixed set of
@@ -23,9 +21,9 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Everything needed to attach a bucket on any S3-compatible provider.
+/// Everything needed to attach a third-party object store (operator-supplied).
 #[derive(Clone, Debug)]
-pub struct S3Config {
+pub struct RemoteConfig {
     /// Base endpoint, e.g. `https://s3.amazonaws.com`, `https://<acct>.r2.cloudflarestorage.com`,
     /// or `http://localhost:9000` for MinIO.
     pub endpoint_url: String,
@@ -39,9 +37,9 @@ pub struct S3Config {
     pub prefix: String,
 }
 
-/// An object store that speaks the S3 REST API against `config.endpoint_url`.
-pub struct S3Store {
-    config: S3Config,
+/// An object store that speaks the standard object HTTP API against `config.endpoint_url`.
+pub struct RemoteObjectStore {
+    config: RemoteConfig,
     client: reqwest::blocking::Client,
     /// `host` portion of the endpoint, used in the signed `Host` header.
     host: String,
@@ -49,10 +47,10 @@ pub struct S3Store {
     scheme: String,
 }
 
-impl S3Store {
+impl RemoteObjectStore {
     /// Build a client for the given config. Does not perform any network I/O;
     /// the first request validates connectivity/credentials.
-    pub fn new(config: S3Config) -> Result<Self, StorageError> {
+    pub fn new(config: RemoteConfig) -> Result<Self, StorageError> {
         let url = config
             .endpoint_url
             .strip_suffix('/')
@@ -67,7 +65,7 @@ impl S3Store {
             .build()
             .map_err(|e| StorageError::Backend(e.to_string()))?;
         Ok(Self {
-            config: S3Config {
+            config: RemoteConfig {
                 endpoint_url: format!("{scheme}://{host}"),
                 ..config
             },
@@ -211,7 +209,7 @@ fn format_amz_date(now: &time::OffsetDateTime) -> String {
 }
 
 #[async_trait]
-impl ObjectStore for S3Store {
+impl ObjectStore for RemoteObjectStore {
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         let this = self.clone_handle();
         let object_key = self.object_key(key);
@@ -271,11 +269,11 @@ impl ObjectStore for S3Store {
     }
 }
 
-impl S3Store {
+impl RemoteObjectStore {
     /// Cheap handle clone for moving into a blocking task (reqwest client is
     /// internally reference-counted; config is small).
-    fn clone_handle(&self) -> S3Store {
-        S3Store {
+    fn clone_handle(&self) -> RemoteObjectStore {
+        RemoteObjectStore {
             config: self.config.clone(),
             client: self.client.clone(),
             host: self.host.clone(),
@@ -290,7 +288,7 @@ mod tests {
 
     #[test]
     fn object_key_applies_prefix_and_encoding() {
-        let cfg = S3Config {
+        let cfg = RemoteConfig {
             endpoint_url: "https://s3.example.com".into(),
             region: "us-east-1".into(),
             bucket: "b".into(),
@@ -298,7 +296,7 @@ mod tests {
             secret_access_key: "sk".into(),
             prefix: "falcon/cache".into(),
         };
-        let s = S3Store::new(cfg).unwrap();
+        let s = RemoteObjectStore::new(cfg).unwrap();
         assert_eq!(s.object_key(b"bucket_3"), "falcon/cache/bucket_3");
         assert_eq!(s.host, "s3.example.com");
         assert_eq!(s.scheme, "https");
@@ -306,7 +304,7 @@ mod tests {
 
     #[test]
     fn sigv4_signing_key_is_deterministic() {
-        let cfg = S3Config {
+        let cfg = RemoteConfig {
             endpoint_url: "https://s3.amazonaws.com".into(),
             region: "us-east-1".into(),
             bucket: "b".into(),
@@ -314,7 +312,7 @@ mod tests {
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
             prefix: String::new(),
         };
-        let s = S3Store::new(cfg).unwrap();
+        let s = RemoteObjectStore::new(cfg).unwrap();
         // Same inputs must always produce the same signature (no time dependence
         // in the derived signing key itself).
         let a = s.sign("20150830", "test-string-to-sign");

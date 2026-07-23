@@ -1,6 +1,9 @@
 use falcon_events::ChangeEvent;
 use falcon_proto::replication::replication_client::ReplicationClient;
-use falcon_proto::replication::{HandshakeRequest, SnapshotRequest, StreamChangesRequest};
+use falcon_proto::replication::{
+    forward_write_request, ForwardWriteRequest, HandshakeRequest, SnapshotRequest,
+    StreamChangesRequest,
+};
 use falcon_storage::StorageEngine;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +49,25 @@ pub async fn run_follower(
     }
 }
 
+/// Connect a gRPC channel to `addr`, negotiating TLS automatically when the
+/// address is `https://` (using the platform's native root certificates). A
+/// plain `http://` address connects without TLS. This is the single place
+/// every replication client dials, so the TLS policy is uniform.
+async fn connect_channel(addr: &str) -> Result<Channel, tonic::Status> {
+    let mut endpoint = Channel::from_shared(addr.to_string())
+        .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+    if addr.starts_with("https://") {
+        let tls = tonic::transport::ClientTlsConfig::new().with_native_roots();
+        endpoint = endpoint
+            .tls_config(tls)
+            .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+    }
+    endpoint
+        .connect()
+        .await
+        .map_err(|e| tonic::Status::unavailable(e.to_string()))
+}
+
 /// Wrap a message into a `Request` carrying the auth token (if any) as
 /// `authorization` metadata. Empty token = no metadata added.
 fn authed<T>(msg: T, token: &str) -> tonic::Request<T> {
@@ -66,11 +88,7 @@ async fn follow_once(
     engine: &Arc<dyn StorageEngine>,
     token: &str,
 ) -> Result<(), tonic::Status> {
-    let channel = Channel::from_shared(leader_addr.to_string())
-        .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?
-        .connect()
-        .await
-        .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+    let channel = connect_channel(leader_addr).await?;
     let mut client = ReplicationClient::new(channel);
 
     let handshake = client
@@ -183,11 +201,7 @@ async fn peer_follow_once(
     apply_fn: &ApplyFn,
     token: &str,
 ) -> Result<(), tonic::Status> {
-    let channel = Channel::from_shared(peer_addr.to_string())
-        .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?
-        .connect()
-        .await
-        .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+    let channel = connect_channel(peer_addr).await?;
     let mut client = ReplicationClient::new(channel);
 
     client
@@ -219,4 +233,86 @@ async fn peer_follow_once(
         apply_fn(event).await;
     }
     Ok(())
+}
+
+/// The client side of primary-queue mode: a non-primary node's [`WriteForwarder`].
+/// It dials the primary's replication endpoint and forwards each write as a
+/// `ForwardWrite` RPC, returning the sequence the primary committed. A fresh
+/// channel per call keeps this simple and correct; forwarded writes are not the
+/// hot path (they cross regions), and the committed change still arrives back
+/// via the normal replication stream that mutates local storage.
+pub struct PrimaryForwarder {
+    primary_addr: String,
+    keyspace: String,
+    origin_region: String,
+    auth_token: String,
+}
+
+impl PrimaryForwarder {
+    pub fn new(
+        primary_addr: String,
+        keyspace: String,
+        origin_region: String,
+        auth_token: String,
+    ) -> Self {
+        Self {
+            primary_addr,
+            keyspace,
+            origin_region,
+            auth_token,
+        }
+    }
+
+    async fn forward(
+        &self,
+        value: Option<forward_write_request::Value>,
+        ttl_secs: u64,
+        key: &[u8],
+    ) -> Result<u64, String> {
+        let channel = connect_channel(&self.primary_addr)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut client = ReplicationClient::new(channel);
+        let resp = client
+            .forward_write(authed(
+                ForwardWriteRequest {
+                    keyspace: self.keyspace.clone(),
+                    key: key.to_vec(),
+                    value,
+                    origin_region: self.origin_region.clone(),
+                    ttl_secs,
+                },
+                &self.auth_token,
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(resp.into_inner().sequence)
+    }
+}
+
+#[async_trait::async_trait]
+impl falcon_core::WriteForwarder for PrimaryForwarder {
+    async fn forward_put(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl_secs: Option<u64>,
+    ) -> Result<falcon_events::Sequence, falcon_storage::StorageError> {
+        self.forward(
+            Some(forward_write_request::Value::PutValue(value.to_vec())),
+            ttl_secs.unwrap_or(0),
+            key,
+        )
+        .await
+        .map_err(falcon_storage::StorageError::Backend)
+    }
+
+    async fn forward_delete(
+        &self,
+        key: &[u8],
+    ) -> Result<falcon_events::Sequence, falcon_storage::StorageError> {
+        self.forward(Some(forward_write_request::Value::Tombstone(true)), 0, key)
+            .await
+            .map_err(falcon_storage::StorageError::Backend)
+    }
 }

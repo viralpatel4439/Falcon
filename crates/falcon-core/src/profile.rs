@@ -52,6 +52,15 @@ pub struct ProfileNode {
     pub data_dir: String,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Enable in-process TLS on every server hop (HTTP, wire, gRPC).
+    #[serde(default)]
+    pub tls_enabled: bool,
+    /// PEM certificate chain file (required when `tls_enabled`).
+    #[serde(default)]
+    pub tls_cert: String,
+    /// PEM private key file (required when `tls_enabled`).
+    #[serde(default)]
+    pub tls_key: String,
 }
 
 impl Default for ProfileNode {
@@ -65,6 +74,9 @@ impl Default for ProfileNode {
             api_key: String::new(),
             data_dir: default_data_dir(),
             log_level: default_log_level(),
+            tls_enabled: false,
+            tls_cert: String::new(),
+            tls_key: String::new(),
         }
     }
 }
@@ -104,6 +116,15 @@ pub struct ProfileReplication {
     /// Peer node addresses for multi-region low-latency replication.
     #[serde(default)]
     pub peers: Vec<String>,
+    /// Write model for replicated KV/cache keyspaces: `single-leader` (default),
+    /// `multi-leader` (active-active, last-write-wins), or `primary-queue`
+    /// (forward to a primary, ordered, no lost concurrent writes).
+    #[serde(default = "default_write_mode")]
+    pub write_mode: String,
+}
+
+fn default_write_mode() -> String {
+    "single-leader".into()
 }
 
 impl Default for ProfileReplication {
@@ -114,6 +135,7 @@ impl Default for ProfileReplication {
             grpc_bind: default_grpc_bind(),
             leader_addr: String::new(),
             peers: Vec::new(),
+            write_mode: default_write_mode(),
         }
     }
 }
@@ -126,46 +148,44 @@ fn default_grpc_bind() -> String {
 }
 
 /// Where the `sharded` object-store tier keeps its bucket objects. `local`
-/// (default) uses the node's `data_dir`; `s3` attaches any S3-compatible
-/// third-party store by URL + credentials.
+/// (default) uses the node's `data_dir`; `remote` attaches a third-party object
+/// store the operator fully specifies — Falcon ships no defaults for it. Fields
+/// accept `remote_*` names (with `s3_*` aliases for older profiles).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProfileStorage {
-    /// `local` or `s3`.
+    /// `local` or `remote`.
     #[serde(default = "default_backend")]
     pub backend: String,
-    #[serde(default)]
-    pub s3_endpoint_url: String,
-    #[serde(default = "default_s3_region")]
-    pub s3_region: String,
-    #[serde(default)]
-    pub s3_bucket: String,
-    #[serde(default)]
-    pub s3_access_key_id: String,
-    #[serde(default)]
-    pub s3_secret_access_key: String,
-    #[serde(default)]
-    pub s3_prefix: String,
+    #[serde(default, alias = "s3_endpoint_url")]
+    pub remote_endpoint_url: String,
+    #[serde(default, alias = "s3_region")]
+    pub remote_region: String,
+    #[serde(default, alias = "s3_bucket")]
+    pub remote_bucket: String,
+    #[serde(default, alias = "s3_access_key_id")]
+    pub remote_access_key_id: String,
+    #[serde(default, alias = "s3_secret_access_key")]
+    pub remote_secret_access_key: String,
+    #[serde(default, alias = "s3_prefix")]
+    pub remote_prefix: String,
 }
 
 impl Default for ProfileStorage {
     fn default() -> Self {
         Self {
             backend: default_backend(),
-            s3_endpoint_url: String::new(),
-            s3_region: default_s3_region(),
-            s3_bucket: String::new(),
-            s3_access_key_id: String::new(),
-            s3_secret_access_key: String::new(),
-            s3_prefix: String::new(),
+            remote_endpoint_url: String::new(),
+            remote_region: String::new(),
+            remote_bucket: String::new(),
+            remote_access_key_id: String::new(),
+            remote_secret_access_key: String::new(),
+            remote_prefix: String::new(),
         }
     }
 }
 
 fn default_backend() -> String {
     "local".into()
-}
-fn default_s3_region() -> String {
-    "us-east-1".into()
 }
 
 /// The full profile: which products run here, plus their settings.
@@ -247,6 +267,11 @@ impl Profile {
             "api-key" | "api_key" | "auth.api_key" => self.node.api_key = value.to_string(),
             "data-dir" | "data_dir" | "node.data_dir" => self.node.data_dir = value.to_string(),
             "log-level" | "log_level" => self.node.log_level = value.to_string(),
+            "tls-enabled" | "tls_enabled" => {
+                self.node.tls_enabled = parse_bool(value).map_err(|_| bad("expected true/false"))?
+            }
+            "tls-cert" | "tls_cert" => self.node.tls_cert = value.to_string(),
+            "tls-key" | "tls_key" => self.node.tls_key = value.to_string(),
             "replication.enabled" | "replicate" => {
                 self.replication.enabled =
                     parse_bool(value).map_err(|_| bad("expected true/false"))?
@@ -268,22 +293,44 @@ impl Profile {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
-            "storage.backend" | "storage" => {
-                if value != "local" && value != "s3" {
-                    return Err(bad("expected 'local' or 's3'"));
+            "replication.write_mode" | "write-mode" => {
+                match value {
+                    "single-leader" | "multi-leader" | "primary-queue" => {
+                        self.replication.write_mode = value.to_string()
+                    }
+                    _ => {
+                        return Err(bad(
+                            "expected 'single-leader', 'multi-leader', or 'primary-queue'",
+                        ))
+                    }
                 }
-                self.storage.backend = value.to_string();
             }
-            "storage.s3.url" | "s3-url" => self.storage.s3_endpoint_url = value.to_string(),
-            "storage.s3.region" | "s3-region" => self.storage.s3_region = value.to_string(),
-            "storage.s3.bucket" | "s3-bucket" => self.storage.s3_bucket = value.to_string(),
-            "storage.s3.access_key_id" | "s3-access-key" => {
-                self.storage.s3_access_key_id = value.to_string()
+            "storage.backend" | "storage" => {
+                // Accept `s3` as a legacy alias for `remote`.
+                let v = if value == "s3" { "remote" } else { value };
+                if v != "local" && v != "remote" {
+                    return Err(bad("expected 'local' or 'remote'"));
+                }
+                self.storage.backend = v.to_string();
             }
-            "storage.s3.secret_access_key" | "s3-secret-key" => {
-                self.storage.s3_secret_access_key = value.to_string()
+            "storage.remote.url" | "remote-url" | "s3-url" => {
+                self.storage.remote_endpoint_url = value.to_string()
             }
-            "storage.s3.prefix" | "s3-prefix" => self.storage.s3_prefix = value.to_string(),
+            "storage.remote.region" | "remote-region" | "s3-region" => {
+                self.storage.remote_region = value.to_string()
+            }
+            "storage.remote.bucket" | "remote-bucket" | "s3-bucket" => {
+                self.storage.remote_bucket = value.to_string()
+            }
+            "storage.remote.access_key_id" | "remote-access-key" | "s3-access-key" => {
+                self.storage.remote_access_key_id = value.to_string()
+            }
+            "storage.remote.secret_access_key" | "remote-secret-key" | "s3-secret-key" => {
+                self.storage.remote_secret_access_key = value.to_string()
+            }
+            "storage.remote.prefix" | "remote-prefix" | "s3-prefix" => {
+                self.storage.remote_prefix = value.to_string()
+            }
             other => return Err(ProfileError::UnknownKey(other.to_string())),
         }
         Ok(())
@@ -300,20 +347,34 @@ impl Profile {
             "api-key" | "api_key" | "auth.api_key" => self.node.api_key.clone(),
             "data-dir" | "data_dir" | "node.data_dir" => self.node.data_dir.clone(),
             "log-level" | "log_level" => self.node.log_level.clone(),
+            "tls-enabled" | "tls_enabled" => self.node.tls_enabled.to_string(),
+            "tls-cert" | "tls_cert" => self.node.tls_cert.clone(),
+            "tls-key" | "tls_key" => self.node.tls_key.clone(),
             "replication.enabled" | "replicate" => self.replication.enabled.to_string(),
             "replication.role" => self.replication.role.clone(),
             "replication.grpc_bind" | "grpc-bind" => self.replication.grpc_bind.clone(),
             "replication.leader_addr" | "leader-addr" => self.replication.leader_addr.clone(),
             "replication.peers" | "peers" => self.replication.peers.join(","),
+            "replication.write_mode" | "write-mode" => self.replication.write_mode.clone(),
             "storage.backend" | "storage" => self.storage.backend.clone(),
-            "storage.s3.url" | "s3-url" => self.storage.s3_endpoint_url.clone(),
-            "storage.s3.region" | "s3-region" => self.storage.s3_region.clone(),
-            "storage.s3.bucket" | "s3-bucket" => self.storage.s3_bucket.clone(),
-            "storage.s3.access_key_id" | "s3-access-key" => self.storage.s3_access_key_id.clone(),
-            "storage.s3.secret_access_key" | "s3-secret-key" => {
-                self.storage.s3_secret_access_key.clone()
+            "storage.remote.url" | "remote-url" | "s3-url" => {
+                self.storage.remote_endpoint_url.clone()
             }
-            "storage.s3.prefix" | "s3-prefix" => self.storage.s3_prefix.clone(),
+            "storage.remote.region" | "remote-region" | "s3-region" => {
+                self.storage.remote_region.clone()
+            }
+            "storage.remote.bucket" | "remote-bucket" | "s3-bucket" => {
+                self.storage.remote_bucket.clone()
+            }
+            "storage.remote.access_key_id" | "remote-access-key" | "s3-access-key" => {
+                self.storage.remote_access_key_id.clone()
+            }
+            "storage.remote.secret_access_key" | "remote-secret-key" | "s3-secret-key" => {
+                self.storage.remote_secret_access_key.clone()
+            }
+            "storage.remote.prefix" | "remote-prefix" | "s3-prefix" => {
+                self.storage.remote_prefix.clone()
+            }
             _ => return None,
         })
     }
@@ -329,18 +390,22 @@ impl Profile {
             "api-key",
             "data-dir",
             "log-level",
+            "tls-enabled",
+            "tls-cert",
+            "tls-key",
             "replication.enabled",
             "replication.role",
             "replication.grpc_bind",
             "replication.leader_addr",
             "replication.peers",
+            "replication.write_mode",
             "storage.backend",
-            "storage.s3.url",
-            "storage.s3.region",
-            "storage.s3.bucket",
-            "storage.s3.access_key_id",
-            "storage.s3.secret_access_key",
-            "storage.s3.prefix",
+            "storage.remote.url",
+            "storage.remote.region",
+            "storage.remote.bucket",
+            "storage.remote.access_key_id",
+            "storage.remote.secret_access_key",
+            "storage.remote.prefix",
         ]
         .into_iter()
         .map(|k| (k, self.get(k).unwrap_or_default()))
@@ -359,17 +424,22 @@ impl Profile {
         cfg.wire.enabled = self.node.wire_enabled;
         cfg.wire.bind = self.node.wire_bind.clone();
         cfg.auth.api_key = self.node.api_key.clone();
+        cfg.tls = crate::config::TlsConfig {
+            enabled: self.node.tls_enabled,
+            cert_file: self.node.tls_cert.clone(),
+            key_file: self.node.tls_key.clone(),
+        };
         cfg.storage.data_dir = self.node.data_dir.clone();
 
-        // Storage backend for the sharded tier: local dir or S3-compatible.
-        cfg.storage.backend = if self.storage.backend == "s3" {
-            crate::config::StorageBackend::S3(crate::config::S3BackendConfig {
-                endpoint_url: self.storage.s3_endpoint_url.clone(),
-                region: self.storage.s3_region.clone(),
-                bucket: self.storage.s3_bucket.clone(),
-                access_key_id: self.storage.s3_access_key_id.clone(),
-                secret_access_key: self.storage.s3_secret_access_key.clone(),
-                prefix: self.storage.s3_prefix.clone(),
+        // Storage backend for the sharded tier: local dir or third-party remote.
+        cfg.storage.backend = if self.storage.backend == "remote" || self.storage.backend == "s3" {
+            crate::config::StorageBackend::Remote(crate::config::RemoteBackendConfig {
+                endpoint_url: self.storage.remote_endpoint_url.clone(),
+                region: self.storage.remote_region.clone(),
+                bucket: self.storage.remote_bucket.clone(),
+                access_key_id: self.storage.remote_access_key_id.clone(),
+                secret_access_key: self.storage.remote_secret_access_key.clone(),
+                prefix: self.storage.remote_prefix.clone(),
             })
         } else {
             crate::config::StorageBackend::Local
@@ -404,22 +474,35 @@ impl Profile {
         cfg.queues = Vec::new();
         cfg.streams = Vec::new();
         let replicated = self.replication.enabled;
-        // With S3 attached, KV-ish keyspaces use the sharded object-store tier
-        // (the tier S3 backs); on local storage they use their fast local tiers.
-        let on_s3 = self.storage.backend == "s3";
+        // With remote storage attached, KV-ish keyspaces use the sharded
+        // object-store tier; on local storage they use their fast local tiers.
+        let on_remote = self.storage.backend == "remote" || self.storage.backend == "s3";
+        // Write mode applies to a warm, replicated KV keyspace (multi-leader and
+        // primary-queue both require warm + replication).
+        let write_mode = match self.replication.write_mode.as_str() {
+            "multi-leader" => crate::config::WriteMode::MultiLeader,
+            "primary-queue" => crate::config::WriteMode::PrimaryQueue,
+            _ => crate::config::WriteMode::SingleLeader,
+        };
+        let kv_write_mode = if replicated && !on_remote {
+            write_mode
+        } else {
+            crate::config::WriteMode::SingleLeader
+        };
         for f in self.features.iter() {
             match f {
                 Feature::Cache => cfg.keyspaces.push(KeyspaceConfig {
                     name: "cache".into(),
-                    tier: if on_s3 { TierName::Sharded } else { TierName::Tiered },
-                    replication: replicated && !on_s3,
+                    tier: if on_remote { TierName::Sharded } else { TierName::Tiered },
+                    replication: replicated && !on_remote,
                     ..KeyspaceConfig::default_keyspace()
                 }),
                 Feature::Kv => cfg.keyspaces.push(KeyspaceConfig {
                     name: "default".into(),
-                    tier: if on_s3 { TierName::Sharded } else { TierName::Warm },
+                    tier: if on_remote { TierName::Sharded } else { TierName::Warm },
                     subscriptions: true,
-                    replication: replicated && !on_s3,
+                    replication: replicated && !on_remote,
+                    write_mode: kv_write_mode,
                     ..KeyspaceConfig::default_keyspace()
                 }),
                 Feature::Pubsub => cfg.topics.push(TopicConfig {
@@ -508,33 +591,71 @@ mod tests {
     }
 
     #[test]
-    fn s3_backend_roundtrips_and_switches_tier_to_sharded() {
+    fn remote_backend_roundtrips_and_switches_tier_to_sharded() {
         let mut p = Profile::default();
         p.features.insert(Feature::Cache);
-        p.set("storage.backend", "s3").unwrap();
-        p.set("s3-url", "https://s3.example.com").unwrap();
-        p.set("s3-bucket", "my-bucket").unwrap();
-        p.set("s3-access-key", "AKIA").unwrap();
-        p.set("s3-secret-key", "sekret").unwrap();
-        assert_eq!(p.get("storage.backend").unwrap(), "s3");
-        assert_eq!(p.get("s3-bucket").unwrap(), "my-bucket");
+        p.set("storage.backend", "remote").unwrap();
+        p.set("remote-url", "https://store.example.com").unwrap();
+        p.set("remote-bucket", "my-bucket").unwrap();
+        p.set("remote-access-key", "KEYID").unwrap();
+        p.set("remote-secret-key", "sekret").unwrap();
+        assert_eq!(p.get("storage.backend").unwrap(), "remote");
+        assert_eq!(p.get("remote-bucket").unwrap(), "my-bucket");
 
         let cfg = p.to_config();
-        // With S3 attached, the cache keyspace uses the object-store (sharded) tier.
+        // With remote storage attached, KV keyspaces use the object-store tier.
         assert_eq!(cfg.keyspaces[0].tier, TierName::Sharded);
         match cfg.storage.backend {
-            crate::config::StorageBackend::S3(s3) => {
-                assert_eq!(s3.bucket, "my-bucket");
-                assert_eq!(s3.endpoint_url, "https://s3.example.com");
+            crate::config::StorageBackend::Remote(r) => {
+                assert_eq!(r.bucket, "my-bucket");
+                assert_eq!(r.endpoint_url, "https://store.example.com");
             }
-            _ => panic!("expected S3 backend"),
+            _ => panic!("expected remote backend"),
         }
+    }
+
+    #[test]
+    fn s3_keys_are_accepted_as_legacy_aliases() {
+        let mut p = Profile::default();
+        p.set("storage.backend", "s3").unwrap(); // legacy -> normalized to remote
+        p.set("s3-bucket", "b").unwrap();
+        assert_eq!(p.get("storage.backend").unwrap(), "remote");
+        assert_eq!(p.get("remote-bucket").unwrap(), "b");
     }
 
     #[test]
     fn storage_backend_rejects_unknown_kind() {
         let mut p = Profile::default();
         assert!(p.set("storage.backend", "gcs").is_err());
+    }
+
+    #[test]
+    fn primary_queue_write_mode_plumbs_to_kv_keyspace() {
+        let mut p = Profile::default();
+        p.features.insert(Feature::Kv);
+        p.set("replicate", "true").unwrap();
+        p.set("write-mode", "primary-queue").unwrap();
+        let cfg = p.to_config();
+        let kv = cfg.keyspaces.iter().find(|k| k.name == "default").unwrap();
+        assert_eq!(kv.write_mode, crate::config::WriteMode::PrimaryQueue);
+        assert!(kv.replication);
+    }
+
+    #[test]
+    fn write_mode_rejects_unknown() {
+        let mut p = Profile::default();
+        assert!(p.set("write-mode", "quorum").is_err());
+    }
+
+    #[test]
+    fn tls_config_plumbs_through() {
+        let mut p = Profile::default();
+        p.set("tls-enabled", "true").unwrap();
+        p.set("tls-cert", "/etc/falcon/cert.pem").unwrap();
+        p.set("tls-key", "/etc/falcon/key.pem").unwrap();
+        let cfg = p.to_config();
+        assert!(cfg.tls.is_enabled());
+        assert_eq!(cfg.tls.cert_file, "/etc/falcon/cert.pem");
     }
 
     #[test]

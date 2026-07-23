@@ -22,6 +22,9 @@ pub struct Cli {
     pub command: Command,
 }
 
+// The CLI is parsed once at startup, so a large `Install` variant costs
+// nothing at runtime; clap-derived subcommands can't hold a boxed args struct.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Install a Falcon product into your profile (cache | kv | pubsub | queue | stream).
@@ -102,25 +105,28 @@ pub struct InstallArgs {
     /// Leader address (required when role=follower).
     #[arg(long)]
     pub leader_addr: Option<String>,
+    /// Write model: single-leader (default), multi-leader, or primary-queue.
+    #[arg(long)]
+    pub write_mode: Option<String>,
 
-    /// Storage backend: `local` (default) or `s3` for third-party object storage.
+    /// Storage backend: `local` (default) or `remote` for third-party object storage.
     #[arg(long)]
     pub storage: Option<String>,
-    /// S3-compatible endpoint URL (e.g. https://s3.amazonaws.com, http://localhost:9000).
+    /// Remote store endpoint URL (required for `--storage remote`; no default).
     #[arg(long)]
-    pub s3_url: Option<String>,
-    /// S3 region (default us-east-1; use `auto` for Cloudflare R2).
+    pub remote_url: Option<String>,
+    /// Remote store region label, if the store requires one (else omit).
     #[arg(long)]
-    pub s3_region: Option<String>,
-    /// S3 bucket name.
+    pub remote_region: Option<String>,
+    /// Remote store bucket/container name (required for `--storage remote`).
     #[arg(long)]
-    pub s3_bucket: Option<String>,
-    /// S3 access key id.
+    pub remote_bucket: Option<String>,
+    /// Remote store access key id (required for `--storage remote`).
     #[arg(long)]
-    pub s3_access_key: Option<String>,
-    /// S3 secret access key.
+    pub remote_access_key: Option<String>,
+    /// Remote store secret key (required for `--storage remote`).
     #[arg(long)]
-    pub s3_secret_key: Option<String>,
+    pub remote_secret_key: Option<String>,
 }
 
 #[derive(Args, Debug)]

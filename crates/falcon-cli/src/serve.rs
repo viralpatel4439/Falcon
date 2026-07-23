@@ -51,6 +51,9 @@ pub fn run(profile_flag: &Option<String>, args: ServeArgs) -> anyhow::Result<()>
         .with_env_filter(tracing_subscriber::EnvFilter::new(&args.log_level))
         .init();
 
+    // Select the rustls crypto provider once, before any TLS listener is built.
+    falcon_core::tls::init_crypto_provider();
+
     let active = profile.features.clone();
     let config = build_config(&profile, &args)?;
 

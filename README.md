@@ -391,13 +391,17 @@ falcon status                            # installed products + build + settings
 | `grpc-bind` | `0.0.0.0:7070` | Address the replication gRPC server listens on. |
 | `leader-addr` | `http://10.0.0.1:7070` | The leader to follow (**required** when `role = follower`). |
 | `peers` | `10.0.0.2:7070,10.0.0.3:7070` | Peer nodes for multi-region replication (or use `falcon peers add/remove`). |
-| `storage.backend` | `local` / `s3` | Backing store for the object-store tier: local disk or S3-compatible. |
-| `s3-url` | `https://s3.amazonaws.com` | S3-compatible endpoint URL (any provider). |
-| `s3-region` | `us-east-1` | S3 region label (`auto` for Cloudflare R2). |
-| `s3-bucket` | `my-bucket` | S3 bucket name. |
-| `s3-access-key` | `AKIA...` | S3 access key id. |
-| `s3-secret-key` | `...` | S3 secret access key (masked in the UI). |
-| `s3-prefix` | `falcon` | Optional object-name prefix so keyspaces can share a bucket. |
+| `write-mode` | `single-leader` / `multi-leader` / `primary-queue` | Multi-region write model (see [Multi-region replication](#multi-region-replication)). |
+| `tls-enabled` | `true` | Turn on in-process TLS for **all** hops (HTTP, wire, gRPC). Off by default. |
+| `tls-cert` | `/path/cert.pem` | PEM certificate chain (required when `tls-enabled`). |
+| `tls-key` | `/path/key.pem` | PEM private key (required when `tls-enabled`). |
+| `storage.backend` | `local` / `remote` | Backing store for the object-store tier: local disk or a third-party store. |
+| `remote-url` | (your endpoint) | Third-party object-store endpoint URL. **No default.** |
+| `remote-region` | (your region) | Region label if your store needs one (else omit). |
+| `remote-bucket` | (your bucket) | Bucket/container name. **No default.** |
+| `remote-access-key` | (your key id) | Access key id. **No default.** |
+| `remote-secret-key` | (your secret) | Secret key (masked in the UI). **No default.** |
+| `remote-prefix` | `falcon` | Optional object-name prefix so keyspaces can share a bucket. |
 
 Set any of them with `falcon config set <key> <value>`; read one back with
 `falcon config get <key>`; see them all with `falcon config list`. The web UI's
@@ -417,50 +421,48 @@ UI's config panel writes the same profile file (`POST /config`, auth-gated).
 By default, data lives on **local disk** at `data-dir` (`./data`) — mount a
 Docker volume there and it works. Set it with `falcon config set data-dir /path`.
 
-### Attaching third-party object storage (S3-compatible)
+### Attaching third-party object storage
 
-Falcon can store data in **any S3-compatible object store** — AWS S3, MinIO,
-Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean Spaces, Ceph, self-hosted
-gateways. You point it at an endpoint URL and give it credentials; there is no
-provider-specific code. This uses the `sharded` object-store tier under the
-hood (keys hash into a fixed set of bucket objects, with O(1) in-memory reads).
+There are exactly **two** storage kinds: `local` (disk) and `remote`. For
+`remote`, **you supply everything** needed to reach the store — Falcon ships no
+provider defaults and hardcodes nothing. Because the object HTTP API (as
+popularized by S3) is what these stores speak, one `remote` backend reaches any
+of them — managed or self-hosted — by URL + credentials. Internally it uses the
+`sharded` object-store tier (keys hash into a fixed set of bucket objects, O(1)
+in-memory reads).
 
-Attach at install time:
+Attach at install time (all values are yours to provide — no defaults):
 
 ```bash
 falcon install cache \
-  --storage s3 \
-  --s3-url https://s3.amazonaws.com \
-  --s3-region us-east-1 \
-  --s3-bucket my-falcon-bucket \
-  --s3-access-key AKIA... \
-  --s3-secret-key ...
+  --storage remote \
+  --remote-url https://your-endpoint \
+  --remote-bucket my-bucket \
+  --remote-access-key <key-id> \
+  --remote-secret-key <secret> \
+  --remote-region <region-or-omit>
 falcon serve
 ```
 
 Or configure it later (persists to the profile; the secret is masked in the UI):
 
 ```bash
-falcon config set storage.backend s3
-falcon config set s3-url http://localhost:9000        # e.g. MinIO
-falcon config set s3-bucket my-bucket
-falcon config set s3-access-key ...
-falcon config set s3-secret-key ...
-falcon config set s3-region auto                        # 'auto' for Cloudflare R2
+falcon config set storage.backend remote
+falcon config set remote-url http://localhost:9000    # e.g. a self-hosted store
+falcon config set remote-bucket my-bucket
+falcon config set remote-access-key <key-id>
+falcon config set remote-secret-key <secret>
+falcon config set remote-region <region>              # omit if your store has none
 ```
 
-Provider endpoint examples:
+If `storage.backend = remote` but a required field (`url`, `bucket`,
+`access-key`, `secret-key`) is missing, `falcon serve` refuses to start with a
+clear error — remote storage is never half-configured.
 
-| Provider | `--s3-url` | `--s3-region` |
-|----------|-----------|---------------|
-| AWS S3 | `https://s3.<region>.amazonaws.com` | your region |
-| MinIO (self-hosted) | `http://<host>:9000` | `us-east-1` |
-| Cloudflare R2 | `https://<account>.r2.cloudflarestorage.com` | `auto` |
-| Backblaze B2 | `https://s3.<region>.backblazeb2.com` | your region |
-
-> The S3 backend is compiled into the **full** build and any build with the
-> `feat-s3` cargo feature. Multiple keyspaces can share one bucket — each gets
-> its own object-name prefix (override with `s3-prefix`).
+> The remote backend is compiled into the **full** build and any build with the
+> `feat-remote` cargo feature. Multiple keyspaces can share one bucket — each
+> gets its own object-name prefix (override with `remote-prefix`). Legacy `s3-*`
+> keys are still accepted as aliases.
 
 ## Binary protocol (`:6380`)
 
@@ -619,13 +621,55 @@ Every node is a leader and lists the others as peers; writes converge via
 Hybrid Logical Clock **last-write-wins** (eventual consistency — concurrent
 same-key writes resolve deterministically, one wins, no merge).
 
+> **Important:** multi-leader guarantees all regions *converge to the same
+> value*, but **not that the real-latest write survives**. When two regions
+> write the same key concurrently, the one with the higher HLC wins and the
+> other is **dropped** — and HLC is not a perfect global clock, so the dropped
+> one may actually have been last in real time. Use `primary-queue` below if you
+> must never lose a concurrent write.
+
 ```bash
 # On each node: role=leader, and add every OTHER node as a peer.
-falcon install kv --node-id us --region us-east-1 --replicate --role leader
+falcon install kv --node-id us --region us-east-1 --replicate --role leader --write-mode multi-leader
 falcon peers add http://eu-host:7070
 falcon peers add http://ap-host:7070
 falcon serve
 ```
+
+### Primary-queue (no lost concurrent writes)
+
+Any region **accepts** writes, but instead of applying them locally they are
+**forwarded to one primary**, which commits them in a **single ordered queue**
+and streams the committed log to every region. Because there is one
+serialization point, concurrent writes to the same key are ordered rather than
+raced — **no write is ever dropped**. The cost is a cross-region hop for
+non-primary writers (the write is acked once the primary commits it durably).
+
+```
+   client ─put─▶ follower(eu) ──forward──▶ PRIMARY(us) ─commit(ordered queue)─┐
+                                                                              │
+   follower(eu) ◀── committed change ◀── stream to all regions ◀─────────────┘
+   (local storage mutates from the stream, not from the client call)
+```
+
+```bash
+# Primary (the ordering authority): role=leader.
+falcon install kv --node-id us --region us-east-1 --replicate --role leader --write-mode primary-queue
+falcon serve
+
+# Other regions: role=follower, forward writes to the primary.
+falcon install kv --node-id eu --region eu-west-1 --replicate --role follower \
+      --leader-addr http://<primary-host>:7070 --write-mode primary-queue
+falcon serve
+```
+
+**Choosing a mode:**
+
+| Mode | Concurrent same-key writes | Local write latency | Use when |
+|------|----------------------------|---------------------|----------|
+| `single-leader` | only the leader writes | leader: local; others: N/A | one writer region, strong order |
+| `multi-leader` | converge, **one dropped** (LWW) | local (fast) everywhere | low latency, eventual consistency OK |
+| `primary-queue` | **all kept**, total order | primary: local; others: cross-region hop | must not lose any write |
 
 Manage the peer set any time (persists to the profile, takes effect on next
 `serve`):
@@ -638,6 +682,40 @@ falcon peers list                        # peers + role + grpc bind
 
 > **Ports to open between regions:** `7070/tcp` (gRPC replication). `8080` (HTTP)
 > and `6380` (wire) are for clients, not node-to-node traffic.
+
+## Protocols & transport security
+
+Falcon uses the right protocol for each hop rather than one protocol
+everywhere — each is chosen to be **fast, safe, reliable, and durable**:
+
+| Hop | Protocol | Why | fast · safe · reliable · durable |
+|-----|----------|-----|----------------------------------|
+| client ↔ service (KV hot path) | binary TCP, pipelined | lowest latency for small ops (µs-scale, Redis-class); one persistent stream | ✅ fastest · ✅ AUTH + TLS · ✅ ordered per connection · ✅ writes hit the group-commit WAL |
+| client ↔ service (REST/UI) | HTTP/1.1 + HTTP/2 | ubiquitous, browser + curl friendly | ✅ · ✅ TLS · ✅ · ✅ |
+| service → client (realtime) | WebSocket | server-push change feeds | ✅ · ✅ TLS · ✅ · ✅ (underlying write is durable) |
+| service ↔ service (replication) | gRPC / HTTP/2 | streaming, flow-control, multiplexing for log shipping | ✅ · ✅ TLS + token · ✅ resumes from durable sequence · ✅ both sides persist |
+
+All hops keep **persistent connections**, so the choice above optimizes the
+per-op path, not just the connection setup.
+
+### TLS everywhere (optional, off by default)
+
+Turn on TLS once and **every** hop — HTTP, wire, and gRPC — listens encrypted:
+
+```bash
+falcon config set tls-enabled true
+falcon config set tls-cert /path/to/cert.pem
+falcon config set tls-key  /path/to/key.pem
+falcon serve            # HTTPS, WSS, binary-over-TLS, and gRPC-over-TLS
+```
+
+TLS is terminated **in process** with rustls (pure-Rust, AES-NI accelerated) —
+**not** via an extra reverse-proxy hop. On Falcon's persistent connections the
+handshake is a **one-time per-connection** cost; per-op encryption is
+AES-NI-accelerated and adds only single-digit **microseconds**, so it does not
+compromise the low-latency hot path. gRPC clients dial `https://` peers with the
+platform's trusted roots automatically; use `http://` for a plaintext peer.
+Leave TLS off (default) on a trusted private network to pay nothing.
 
 ## API key (optional auth)
 

@@ -3,20 +3,42 @@ use futures::Stream;
 use falcon_events::EventBus;
 use falcon_proto::replication::replication_server::Replication;
 use falcon_proto::replication::{
-    ChangeEventProto, HandshakeRequest, HandshakeResponse, SnapshotChunk, SnapshotRequest,
-    StreamChangesRequest,
+    forward_write_request, ChangeEventProto, ForwardWriteRequest, ForwardWriteResponse,
+    HandshakeRequest, HandshakeResponse, SnapshotChunk, SnapshotRequest, StreamChangesRequest,
 };
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
+/// Applies a write forwarded from a non-primary region on the primary. Returns
+/// the sequence the primary assigned after committing it durably. Wired to the
+/// keyspace's normal ordered write path, so forwarded writes join the same
+/// single-writer queue as the primary's own writes (total order, no loss).
+pub type ForwardApplyFn = Arc<
+    dyn Fn(ForwardedWrite) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A decoded forwarded write handed to [`ForwardApplyFn`].
+pub struct ForwardedWrite {
+    pub key: Vec<u8>,
+    /// `Some(value)` = put, `None` = delete.
+    pub value: Option<Vec<u8>>,
+    pub ttl_secs: u64,
+}
+
 /// Per-keyspace replication resources a leader needs to serve followers:
 /// the durable log to read from, and the event bus to wake up a caught-up
-/// follower stream with low latency instead of polling.
+/// follower stream with low latency instead of polling. In primary-queue mode
+/// the primary also carries an `apply_forwarded` callback to commit writes
+/// forwarded from other regions.
 pub struct KeyspaceReplicationSource {
     pub log_reader: Arc<dyn ReplicationLogReader>,
     pub events: EventBus,
+    pub apply_forwarded: Option<ForwardApplyFn>,
 }
 
 pub struct ReplicationServerImpl {
@@ -196,5 +218,38 @@ impl Replication for ReplicationServerImpl {
         };
 
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn forward_write(
+        &self,
+        request: Request<ForwardWriteRequest>,
+    ) -> Result<Response<ForwardWriteResponse>, Status> {
+        self.check_auth(&request)?;
+        let req = request.into_inner();
+        let source = self
+            .keyspaces
+            .get(&req.keyspace)
+            .ok_or_else(|| Status::not_found(format!("unknown keyspace '{}'", req.keyspace)))?;
+        let apply = source.apply_forwarded.as_ref().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "keyspace '{}' is not a primary-queue primary here",
+                req.keyspace
+            ))
+        })?;
+
+        let value = match req.value {
+            Some(forward_write_request::Value::PutValue(v)) => Some(v),
+            Some(forward_write_request::Value::Tombstone(_)) | None => None,
+        };
+        let write = ForwardedWrite {
+            key: req.key,
+            value,
+            ttl_secs: req.ttl_secs,
+        };
+        // Commit through the primary's ordered write path.
+        let sequence = apply(write)
+            .await
+            .map_err(|e| Status::internal(format!("forwarded write failed: {e}")))?;
+        Ok(Response::new(ForwardWriteResponse { sequence }))
     }
 }

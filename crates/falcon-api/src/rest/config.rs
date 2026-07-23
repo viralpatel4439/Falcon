@@ -38,7 +38,7 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
         .map(|(k, v)| ConfigEntry {
             key: k.to_string(),
             // Never echo secrets back to the browser in full.
-            value: if matches!(k, "api-key" | "storage.s3.secret_access_key") && !v.is_empty() {
+            value: if matches!(k, "api-key" | "storage.remote.secret_access_key") && !v.is_empty() {
                 "••••••".to_string()
             } else {
                 v

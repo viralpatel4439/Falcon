@@ -10,6 +10,7 @@ default = ["cold"]
 cold = ["falcon-storage/cold"]
 
 [dependencies]
+falcon-core = { workspace = true, default-features = false }
 falcon-events = { workspace = true }
 falcon-storage = { workspace = true }
 falcon-proto = { workspace = true }

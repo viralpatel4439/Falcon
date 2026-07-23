@@ -6,13 +6,13 @@ license.workspace = true
 
 [features]
 # Default = the full node: every storage tier and remote object storage.
-default = ["cold", "s3"]
+default = ["cold", "remote"]
 # `cold` enables the sled-backed cold tier and the tiered (RAM+cold) tier —
 # the heavy on-disk dependency (sled). A build needing neither omits it.
 cold = ["falcon-storage/cold"]
-# `s3` enables attaching third-party S3-compatible object storage — the heavy
-# remote dependency (reqwest + SigV4 signing). Only compiled when wanted.
-s3 = ["falcon-storage/s3"]
+# `remote` enables attaching third-party object storage (operator-supplied) —
+# the heavy remote dependency (reqwest + SigV4 signing). Only compiled when wanted.
+remote = ["falcon-storage/remote"]
 
 [dependencies]
 falcon-events = { workspace = true }
@@ -25,6 +25,9 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 toml = { workspace = true }
+async-trait = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
