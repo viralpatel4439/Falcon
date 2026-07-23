@@ -69,9 +69,9 @@ pub fn build_log_reader(engine: &Arc<dyn StorageEngine>) -> Option<Arc<dyn Repli
             let concrete = any.downcast::<TieredEngine>().ok()?;
             Some(Arc::new(TieredLogReader(concrete)) as Arc<dyn ReplicationLogReader>)
         }
-        // File-per-key and sharded have no ordered durable log to stream, so
-        // they can't be a replication *source* (leader) — they can still be a
+        // The sharded object-store tier has no ordered durable log to stream,
+        // so it can't be a replication *source* (leader) — it can still be a
         // replication target (apply_replicated works). None reflects that.
-        StorageTier::FilePerKey | StorageTier::Sharded => None,
+        StorageTier::Sharded => None,
     }
 }

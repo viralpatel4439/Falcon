@@ -10,7 +10,6 @@ pub enum StorageTier {
     Warm,
     Cold,
     Tiered,
-    FilePerKey,
     Sharded,
 }
 
@@ -21,7 +20,6 @@ impl StorageTier {
             StorageTier::Warm => "warm",
             StorageTier::Cold => "cold",
             StorageTier::Tiered => "tiered",
-            StorageTier::FilePerKey => "file-per-key",
             StorageTier::Sharded => "sharded",
         }
     }

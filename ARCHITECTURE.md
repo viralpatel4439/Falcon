@@ -39,9 +39,8 @@ metrics are identical no matter how a request arrives.
              ▼              ▼                              ships ordered log
      ┌───────────────┐  durable append logs                    to followers
      │ StorageEngine │  (topic/queue/stream/offset files)
-     │ hot·warm·cold │
-     │ tiered·sharded│  ◀── every KV write becomes one ChangeEvent, observed
-     │ file-per-key  │      identically by subscribers AND replication
+     │ hot·warm·cold │  ◀── every KV write becomes one ChangeEvent, observed
+     │ tiered·sharded│      identically by subscribers AND replication
      └───────────────┘
 ```
 
@@ -52,11 +51,12 @@ The rest of this document goes tier by tier and subsystem by subsystem.
 ## 1. Crate map
 
 ```
-falcon-cli          binary entrypoint: config load, wiring, server startup
-├── falcon-api      REST (axum) + WebSocket subscription servers
+falcon-cli          the `falcon` binary: subcommands (serve + client), the
+│                   multi-core runtime, config load/merge, server wiring
+├── falcon-api      REST (axum) + WebSocket servers + embedded dashboard UI
 ├── falcon-wire     binary pipelined TCP protocol (:6380)
 ├── falcon-core     Node/Keyspace: ties engines to events, TTL, write modes
-│   ├── falcon-storage    storage engines (hot/warm/cold/tiered/file-per-key/SHARDED)
+│   ├── falcon-storage    storage engines (hot/warm/cold/tiered/sharded object store)
 │   ├── falcon-messaging  topics, queues, and STREAMS (event streaming)
 │   └── falcon-events     ChangeEvent, EventBus (broadcast), HLC clock
 ├── falcon-replication    gRPC leader/follower + multi-leader log shipping
@@ -108,8 +108,7 @@ keyspace swap engines by config with no change upstream.
 | `warm` (default) | RAM index + group-commit WAL | fsync'd | general purpose, low-latency durable | append log + sparse index |
 | `cold` | sled | fsync'd | datasets larger than RAM | B-tree (sled) |
 | `tiered` | RAM working set + disk tail | fsync'd | far-larger-than-RAM with hot set | CLOCK eviction |
-| `file-per-key` | one object per key | atomic write-rename | portable/inspectable, object-store seam | — |
-| **`sharded`** | **N bucket objects** | sync or coalesced | **cheap 3rd-party object storage** | **hash bucketing + in-mem index** |
+| **`sharded`** | **N bucket objects** (local dir or remote bucket) | sync or coalesced | **cheap object storage, local or 3rd-party** | **hash bucketing + in-mem index** |
 
 ### 3.1 Concurrency primitives shared across engines
 
@@ -127,11 +126,13 @@ keyspace swap engines by config with no change upstream.
 
 ## 4. Sharded storage engine (bucket-per-hash)
 
-**Problem it solves.** `file-per-key` stores one object per key. On a
-third-party, request-billed object store (S3-compatible or otherwise) that
-means **one billed PUT/GET per key** — pathologically expensive at scale, and
-slow (a network round-trip per key). Users asked for object-store portability
-*without* per-key cost.
+**Problem it solves.** A naive object-store layout puts one object per key. On a
+request-billed object store (S3-compatible or otherwise) that means **one billed
+PUT/GET per key** — pathologically expensive at scale, and slow (a network
+round-trip per key). Falcon needs object-store portability *without* per-key
+cost, behaving the same on local disk and a remote bucket. (An earlier
+`file-per-key` tier did one object per key; it was removed for exactly this cost
+reason — `sharded` fully replaces it.)
 
 **Design.** Keys are hashed into a small, fixed number of **buckets**; each
 bucket is persisted as **one object** in the backing `ObjectStore`. So a
@@ -191,7 +192,7 @@ all big-endian. Decoding validates every length against the buffer, returning
   count.
 - **Durability across restart** (tested): reopening rebuilds each bucket's map
   lazily from its object; deletes survive.
-- **Not a replication leader.** Like `file-per-key`, sharded has no ordered
+- **Not a replication leader.** Sharded has no ordered
   durable log to ship, so it can be a replication *target* (`apply_replicated`
   works) but config rejects it as a *leader*.
 
@@ -397,6 +398,31 @@ are never rewritten needlessly.
 `DefaultBodyLimit` layer, so a single huge PUT is rejected with `413` before it
 can allocate. `0` disables the cap.
 
+### 7.6 CLI & embedded web console
+
+The `falcon` binary (`falcon-cli`) is both the server and the client:
+
+- **`falcon serve`** builds an explicit multi-threaded Tokio runtime — one
+  worker per logical CPU by default, `--worker-threads N` to pin — so every
+  subsystem runs concurrently across all cores. Every config value is settable
+  by flag or `FALCON_*` env (`--topic`, `--queue`, `--stream`, `--default-tier`,
+  …), overriding the TOML file: **defaults < file < env < flags**.
+- **Client subcommands** (`get/put/del/scan`, `topic publish`, `queue
+  push/pop`, `stream append/poll`, `health`, `metrics`) are synchronous
+  (blocking `reqwest`) one-shots that hit the node's REST API at `--addr`.
+- **Embedded web console** (`falcon-api/assets/dashboard.html`,
+  `include_str!`-baked into the binary, served at `/`): a single self-contained
+  page — no build step, no external assets — that drives the same REST API and
+  `/metrics` a human would. Live metric tiles, component status, a KV browser
+  (scan/put/delete), and topic/queue/stream listings, refreshing every 2 s. It
+  and the liveness/metrics endpoints bypass auth to load; its *data* calls carry
+  the API key.
+
+To make these usable, pub/sub and queues gained REST routes
+(`/topics/{t}/publish`, `/queues/{q}/push|pop|ack`) alongside the existing
+stream routes, so all messaging is reachable over HTTP as well as the wire
+protocol.
+
 ---
 
 ## 8. Events & replication
@@ -410,8 +436,8 @@ can allocate. `0` disables the cap.
   Logical Clock** and applied via last-write-wins. Concurrent same-key writes
   converge deterministically (one wins, no merge) — eventual consistency. Only
   the warm tier supports it (HLC is persisted there).
-- Engines without an ordered log (`file-per-key`, `sharded`) can be replication
-  *targets* but not *leaders* — enforced at config validation.
+- The `sharded` object-store tier has no ordered log, so it can be a replication
+  *target* but not a *leader* — enforced at config validation.
 
 ### 8.1 Ordering & catch-up under concurrent writes
 
@@ -510,8 +536,11 @@ has **105 tests across 43 binaries, all green**.
 | Event streaming | `crates/falcon-messaging/src/stream.rs` |
 | Metrics registry + Prometheus | `crates/falcon-metrics/src/` |
 | WAL compaction | `crates/falcon-storage/src/warm.rs` (`compact_inner`) |
-| /metrics, /readyz, body limit | `crates/falcon-api/src/rest/handlers.rs`, `server.rs` |
-| Graceful shutdown + compactor | `crates/falcon-core/src/node.rs`, `crates/falcon-cli/src/main.rs` |
+| /metrics, /readyz, body limit, dashboard | `crates/falcon-api/src/rest/handlers.rs`, `server.rs` |
+| Embedded web console | `crates/falcon-api/assets/dashboard.html` |
+| REST topic/queue/stream routes | `crates/falcon-api/src/rest/{messaging,streams}.rs` |
+| CLI subcommands + multi-core runtime | `crates/falcon-cli/src/{cli,main,serve,client}.rs` |
+| Graceful shutdown + compactor | `crates/falcon-core/src/node.rs`, `crates/falcon-cli/src/serve.rs` |
 | Topics / queues / log | `crates/falcon-messaging/src/{topic,queue,log}.rs` |
 | Keyspace (write→event) | `crates/falcon-core/src/keyspace.rs` |
 | Node wiring | `crates/falcon-core/src/node.rs` |

@@ -29,17 +29,13 @@ behind a good number.
   - `tiered` — automatic hot/cold: hot working set in RAM, cold tail auto-spilled
     to disk (CLOCK eviction), so you can hold far more than RAM and pay RAM only
     for the working set
-  - `file-per-key` — each value is an independent file/object (portable,
-    inspectable; the seam for third-party object stores). **Portability tier,
-    not a hot tier** — one I/O (or one billed request on a remote bucket) *per
-    key*, no in-memory index. For hot/cost-sensitive object storage use
-    `sharded` instead.
-  - `sharded` — **the optimized object-store engine.** Keys are **hashed into a
-    fixed set of buckets**, each bucket stored as one object in the backing
-    store, so *N keys cost a fixed object count* no matter how large N gets.
-    O(1) point reads from an in-memory index; writes coalesce per bucket. This
-    is the cost-efficient, fast way to sit on a request-billed object store —
-    use it instead of `file-per-key` for anything under load.
+  - `sharded` — **the object-store tier** (local disk today, a third-party
+    bucket via the same `ObjectStore` trait tomorrow). Keys are **hashed into a
+    fixed set of buckets**, each bucket stored as one object, so *N keys cost a
+    fixed object count* no matter how large N gets — the cost-efficient way to
+    sit on a request-billed object store (one object per *bucket*, not per key).
+    O(1) point reads from an in-memory index; writes coalesce per bucket.
+    Behaves identically on local disk and remote buckets.
 - **Pub/Sub topics** — `ephemeral` (fast, at-most-once) or `durable` (persisted,
   replayable, survives restart), selectable per topic
 - **Work queues** — durable, at-least-once, with ack + redelivery-on-timeout and
@@ -62,16 +58,36 @@ behind a good number.
   compaction** (bounds disk + restart time), and **graceful shutdown** (SIGTERM
   drains in-flight requests and force-flushes buffered writes — zero-loss
   autoscaling/rollouts)
+- **Inbuilt web console** — a self-contained dashboard served at `/` (no build
+  step, embedded in the binary): live metrics, KV browser (get/put/delete/scan),
+  topic/queue/stream status, and node health
+- **Full CLI** — one `falcon` binary is both the server *and* the client:
+  `falcon serve` runs a node; `falcon get/put/scan`, `falcon topic publish`,
+  `falcon queue push/pop`, `falcon stream append/poll`, `falcon health/metrics`
+  talk to a running node. Everything is configurable via flags or env.
+- **Multi-core** — an explicit multi-threaded runtime (one worker per logical
+  CPU by default, `--worker-threads N` to pin); every subsystem runs
+  concurrently across all cores.
 
 ## Quickstart
 
 ```bash
 cargo build --release -p falcon-cli
-./target/release/falcon          # zero config: single node, warm tier, ./data
+
+falcon serve                     # zero config: single node, warm tier, ./data
+                                 # → dashboard at http://localhost:8080/
 ```
 
 ```bash
-# CRUD over HTTP
+# …then, in another shell, use the same binary as a client:
+falcon put foo bar
+falcon get foo                   # → bar
+falcon scan --prefix user:
+falcon health
+```
+
+```bash
+# …or the same over plain HTTP
 curl -X PUT localhost:8080/kv/foo -d 'bar'
 curl localhost:8080/kv/foo
 curl -X PUT 'localhost:8080/kv/session?ttl=60' -d 'expires in 60s'
@@ -80,30 +96,66 @@ curl 'localhost:8080/kv?prefix=user:'
 curl localhost:8080/healthz          # shows the active feature set
 ```
 
+## Web console
+
+Open **`http://localhost:8080/`** in a browser. The dashboard is a single
+self-contained page **embedded in the binary** (no build step, no external
+assets, works offline) and auto-refreshes every 2s:
+
+- Live metric tiles (ops, GET hit-rate, WAL size, connections, replication lag)
+- Which components are active (DB, Queue, Pub/Sub, Event Streaming, Realtime,
+  Replication)
+- **KV browser** — scan by prefix, put, and delete keys per keyspace
+- Topic / queue / stream listings, a quick publish box, and per-keyspace status
+
+If the node has auth enabled, the console prompts for the API key (kept in the
+browser's local storage) and sends it on data calls.
+
+## CLI
+
+The one `falcon` binary is both the **server** and a **client**.
+
+```bash
+# Server
+falcon serve --http-bind 0.0.0.0:8080 --data-dir ./data \
+             --topic events:durable --queue jobs --stream clicks:8 \
+             --worker-threads 8          # multi-core; omit = one per CPU
+
+# Client (talks to a running node; --addr / FALCON_ADDR selects it)
+falcon get <key>                         falcon put <key> <value> [--ttl 60]
+falcon del <key>                         falcon scan --prefix user:
+falcon topic publish events 'hi'         falcon queue push jobs 'work'
+falcon queue pop jobs --group g1         falcon stream append clicks 'e' --key u1
+falcon stream poll clicks --partition 0 --group g1
+falcon health                            falcon metrics
+```
+
+Run `falcon --help` or `falcon <command> --help` for every flag. Values omitted
+on the command line are read from **stdin** (e.g. `echo hi | falcon put k`).
+
 ## Config
 
 Everything has a sane default; `config/default.toml` documents every option.
 
 ```bash
-falcon --config config/default.toml
+falcon serve --config config/default.toml
 ```
 
 CLI flags (`--http-bind`, `--wire-bind`, `--node-id`, `--region`, `--data-dir`,
-`--auth-token`, `--log-level`) and matching `FALCON_*` env vars override the file,
-in order: defaults < file < env < flags.
+`--default-tier`, `--api-key`, `--worker-threads`, `--topic`, `--queue`,
+`--stream`, `--subscriptions`, `--log-level`) and matching `FALCON_*` env vars
+override the file, in order: **defaults < file < env < flags**.
 
 ## Storage location
 
 - No config → data lives in `./data` (relative to the working dir). Mount a Docker
   volume there and it "just works."
 - Set `[storage] data_dir` to any path (local disk, network/mounted volume).
-- Set a keyspace's `tier = "file-per-key"` to store each value as its own file —
-  portable and the integration point for third-party object stores (implement the
-  `ObjectStore` trait). This is a portability seam, **not** for hot data.
-- Set `tier = "sharded"` (recommended for object storage under load): the same
-  `ObjectStore` seam, but keys hash into a fixed number of buckets so N keys cost
-  a fixed object count, with O(1) in-memory reads. Tune `shard_buckets` /
-  `shard_flush_ms`.
+- Set `tier = "sharded"` for object storage: the `ObjectStore` seam (local disk
+  today, a third-party bucket via the same trait tomorrow). Keys hash into a
+  fixed number of buckets so N keys cost a fixed object count — cheap on a
+  request-billed store, with O(1) in-memory reads. Tune `shard_buckets` /
+  `shard_flush_ms`. (Behaves identically on local disk and remote buckets.)
 
 ## Binary protocol (`:6380`)
 
@@ -115,9 +167,13 @@ frame layout.
 
 ## Concurrency
 
-Every subsystem serves requests with **true concurrency**, verified by the
-`--bench-all` suite (all numbers there are multi-connection):
+Every subsystem — KV, pub/sub, queues, event streams, realtime DB, and
+replication — serves requests with **true concurrency across all CPU cores**,
+verified by the `--bench-all` suite (all numbers there are multi-connection):
 
+- **Multi-core runtime.** `falcon serve` runs an explicit multi-threaded Tokio
+  runtime with one worker thread per logical CPU by default (`--worker-threads
+  N` to pin). Work is scheduled across every core.
 - **Connections run in parallel.** Each binary-protocol connection is its own
   Tokio task; the HTTP/WebSocket server (axum) handles every request
   concurrently. Thousands of clients make progress at once — nothing funnels

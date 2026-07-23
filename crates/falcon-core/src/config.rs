@@ -139,8 +139,6 @@ pub enum TierName {
     Warm,
     Cold,
     Tiered,
-    #[serde(rename = "file-per-key", alias = "fileperkey")]
-    FilePerKey,
     Sharded,
 }
 
@@ -151,7 +149,6 @@ impl From<TierName> for StorageTier {
             TierName::Warm => StorageTier::Warm,
             TierName::Cold => StorageTier::Cold,
             TierName::Tiered => StorageTier::Tiered,
-            TierName::FilePerKey => StorageTier::FilePerKey,
             TierName::Sharded => StorageTier::Sharded,
         }
     }
@@ -472,10 +469,10 @@ pub enum ConfigError {
     MultiLeaderTier(String),
     #[error("keyspace '{0}': multi-leader requires replication = true")]
     MultiLeaderNeedsReplication(String),
-    #[error("keyspace '{0}': file-per-key tier cannot be a replication leader (no ordered log)")]
-    FilePerKeyReplicationLeader(String),
     #[error("keyspace '{0}': sharded tier cannot be a replication leader (no ordered log)")]
     ShardedReplicationLeader(String),
+    #[error("the 'file-per-key' tier was removed (too costly on object stores) — use tier = \"sharded\" instead")]
+    RemovedFilePerKey,
     #[error("failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
     #[error("io error reading config: {0}")]
@@ -484,6 +481,13 @@ pub enum ConfigError {
 
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
+        // The `file-per-key` tier was removed — it cost one object/request per
+        // key, expensive on third-party object stores. The `sharded` tier
+        // replaces it (fixed object count, works identically on local disk and
+        // remote buckets). Give a clear message instead of a cryptic serde one.
+        if s.contains("file-per-key") || s.contains("fileperkey") {
+            return Err(ConfigError::RemovedFilePerKey);
+        }
         let cfg: Config = toml::from_str(s)?;
         cfg.validate()?;
         Ok(cfg)
@@ -499,15 +503,9 @@ impl Config {
             if ks.tier == TierName::Hot && ks.replication {
                 return Err(ConfigError::HotTierReplicationConflict(ks.name.clone()));
             }
-            // File-per-key has no ordered replication log, so it can't be a
-            // leader source. Reject replication as leader; it can still be a
-            // standalone durable store.
-            if ks.tier == TierName::FilePerKey
-                && ks.replication
-                && self.replication.role == ReplicationRole::Leader
-            {
-                return Err(ConfigError::FilePerKeyReplicationLeader(ks.name.clone()));
-            }
+            // The sharded object-store tier has no ordered replication log, so
+            // it can't be a leader source. Reject replication as leader; it can
+            // still be a standalone durable store or a replication target.
             if ks.tier == TierName::Sharded
                 && ks.replication
                 && self.replication.role == ReplicationRole::Leader

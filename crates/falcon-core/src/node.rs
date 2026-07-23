@@ -270,10 +270,6 @@ fn build_keyspace(
             let capacity_bytes = ks_cfg.hot_capacity_mb * 1024 * 1024;
             Arc::new(TieredEngine::open(&path, capacity_bytes, ks_cfg.evict_sample)?)
         }
-        TierName::FilePerKey => {
-            let path = data_dir.join(format!("{}_files", ks_cfg.name));
-            Arc::new(falcon_storage::FilePerKeyEngine::open_local(&path)?)
-        }
         TierName::Sharded => {
             let path = data_dir.join(format!("{}_shards", ks_cfg.name));
             let policy = if ks_cfg.shard_flush_ms > 0 {

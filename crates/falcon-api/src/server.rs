@@ -1,4 +1,4 @@
-use crate::rest::{handlers, streams};
+use crate::rest::{handlers, messaging, streams};
 use crate::state::AppState;
 use axum::routing::post;
 use crate::ws;
@@ -18,6 +18,7 @@ pub fn router(node: Arc<Node>) -> Router {
     let max_body = state.node.config().storage.max_value_bytes;
 
     let mut app = Router::new()
+        .route("/", get(handlers::dashboard))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/metrics", get(handlers::metrics))
@@ -40,7 +41,12 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/streams/{stream}", get(streams::info))
         .route("/streams/{stream}/records", post(streams::append))
         .route("/streams/{stream}/poll", get(streams::poll))
-        .route("/streams/{stream}/commit", post(streams::commit));
+        .route("/streams/{stream}/commit", post(streams::commit))
+        // Pub/Sub topics + work queues.
+        .route("/topics/{topic}/publish", post(messaging::publish))
+        .route("/queues/{queue}/push", post(messaging::push))
+        .route("/queues/{queue}/pop", post(messaging::pop))
+        .route("/queues/{queue}/ack", post(messaging::ack));
 
     // Anti-OOM: cap request body size so a single huge PUT can't exhaust
     // memory. 0 disables the cap. Applied before handlers run.
@@ -70,9 +76,10 @@ async fn auth_middleware(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Liveness/readiness/metrics endpoints are always unauthenticated so
-    // probes and scrapers work without the key.
-    if matches!(req.uri().path(), "/healthz" | "/readyz" | "/metrics") {
+    // Liveness/readiness/metrics endpoints and the static dashboard page are
+    // always unauthenticated so probes, scrapers, and the UI shell load without
+    // a key. (The dashboard's data calls DO carry the key and are gated.)
+    if matches!(req.uri().path(), "/" | "/healthz" | "/readyz" | "/metrics") {
         return Ok(next.run(req).await);
     }
     let token = &state.node.config().auth.api_key;

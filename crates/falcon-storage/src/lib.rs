@@ -2,7 +2,6 @@
 
 mod cold;
 mod engine;
-mod file_per_key;
 mod hot;
 mod lock_table;
 mod object_store;
@@ -14,7 +13,6 @@ mod wal_writer;
 
 pub use cold::ColdEngine;
 pub use engine::{StorageEngine, StorageError, StorageTier};
-pub use file_per_key::FilePerKeyEngine;
 pub use hot::HotEngine;
 pub use lock_table::KeyLockTable;
 pub use object_store::{LocalDirStore, ObjectStore};

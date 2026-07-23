@@ -15,7 +15,7 @@ services:
     configs:
       - source: leader-config
         target: /config/config.toml
-    entrypoint: ["falcon", "--config", "/config/config.toml"]
+    entrypoint: ["falcon", "serve", "--config", "/config/config.toml"]
 
   follower:
     build:
@@ -35,7 +35,7 @@ services:
     configs:
       - source: follower-config
         target: /config/config.toml
-    entrypoint: ["falcon", "--config", "/config/config.toml"]
+    entrypoint: ["falcon", "serve", "--config", "/config/config.toml"]
 
 volumes:
   leader-data:

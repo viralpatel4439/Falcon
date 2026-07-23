@@ -37,4 +37,6 @@ HEALTHCHECK --interval=10s --timeout=2s --start-period=5s --retries=3 \
 # SIGTERM triggers graceful drain + final durable flush; give it time to finish.
 STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["falcon"]
+# `serve` runs the node; the FALCON_* env vars above configure it. Extra flags
+# (or `--config /path`) can be appended as `docker run ... falcon-image --config …`.
+ENTRYPOINT ["falcon", "serve"]

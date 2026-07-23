@@ -61,6 +61,7 @@ pub struct FeatureSet {
     pub subscriptions: bool,
     pub topics: usize,
     pub queues: usize,
+    pub streams: usize,
 }
 
 #[derive(Serialize)]
@@ -78,6 +79,10 @@ pub struct HealthResponse {
     /// zero at runtime (skip-if-not-configured).
     pub features: FeatureSet,
     pub keyspaces: Vec<KeyspaceHealth>,
+    /// Configured messaging object names (for the dashboard UI).
+    pub topics: Vec<String>,
+    pub queues: Vec<String>,
+    pub streams: Vec<String>,
 }
 
 /// The named Falcon components and whether each is active on this node.
@@ -256,6 +261,16 @@ async fn scan(
     Ok(Json(ScanResponse { items }))
 }
 
+/// The embedded dashboard UI — a single self-contained HTML page (no external
+/// assets, no build step) baked into the binary. Served at `/`. It drives the
+/// same REST API and `/metrics` a human would.
+pub async fn dashboard() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../../assets/dashboard.html"),
+    )
+}
+
 /// Prometheus text-format metrics. Refreshes the durable-size gauge on each
 /// scrape so it's current without a background poller. Unauthenticated by
 /// design (like `/healthz`) so scrapers/probes work without a key — put the
@@ -332,7 +347,11 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             subscriptions: subscriptions_active,
             topics: cfg.topics.len(),
             queues: cfg.queues.len(),
+            streams: cfg.streams.len(),
         },
         keyspaces,
+        topics: cfg.topics.iter().map(|t| t.name.clone()).collect(),
+        queues: cfg.queues.iter().map(|q| q.name.clone()).collect(),
+        streams: cfg.streams.iter().map(|s| s.name.clone()).collect(),
     })
 }

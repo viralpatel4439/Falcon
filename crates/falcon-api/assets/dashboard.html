@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Falcon</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #141922; --panel2: #1b212c; --border: #232b39;
+    --text: #e5e9f0; --muted: #8b96a8; --accent: #4fd1c5;
+    --accent2: #7aa2f7; --ok: #79d97a; --warn: #e0af68; --err: #f7768e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 14px 20px;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header .logo { font-weight: 700; font-size: 18px; letter-spacing: .5px; }
+  header .logo span { color: var(--accent); }
+  header .status { margin-left: auto; display: flex; gap: 16px; align-items: center; font-size: 13px; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--err); }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px; display: grid; gap: 18px; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .card h3 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); font-weight: 600; }
+  .stat { font-size: 26px; font-weight: 700; }
+  .stat .unit { font-size: 13px; color: var(--muted); font-weight: 500; margin-left: 4px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 800px) { .row { grid-template-columns: 1fr; } }
+  h2 { font-size: 15px; margin: 4px 0 0; }
+  input, select, button, textarea {
+    font: inherit; color: var(--text); background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+  }
+  input, textarea { width: 100%; }
+  button {
+    background: var(--accent); color: #06231f; border: none; font-weight: 600;
+    cursor: pointer; padding: 8px 14px;
+  }
+  button:hover { filter: brightness(1.08); }
+  button.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .controls input { flex: 1; min-width: 120px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.val { color: var(--accent); font-family: ui-monospace, monospace; word-break: break-all; }
+  td .mini { background: none; border: none; color: var(--muted); cursor: pointer; padding: 2px 6px; }
+  td .mini:hover { color: var(--err); }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.on { background: rgba(121,217,122,.15); color: var(--ok); }
+  .pill.off { background: rgba(139,150,168,.12); color: var(--muted); }
+  .muted { color: var(--muted); }
+  .toast {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: var(--panel2); border: 1px solid var(--border); padding: 10px 16px;
+    border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .empty { color: var(--muted); padding: 10px 8px; font-style: italic; }
+  code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">🦅 Falcon<span> Console</span></div>
+  <div class="status">
+    <span id="node"></span>
+    <span id="ready"><span class="dot bad"></span>connecting…</span>
+  </div>
+</header>
+
+<main>
+  <!-- Metric tiles -->
+  <div class="grid" id="tiles"></div>
+
+  <!-- Components / features -->
+  <div class="card">
+    <h3>Components</h3>
+    <div id="components" class="grid" style="grid-template-columns: repeat(auto-fit,minmax(130px,1fr));"></div>
+  </div>
+
+  <div class="row">
+    <!-- KV browser -->
+    <div class="card">
+      <h2>FalconDB — Key/Value</h2>
+      <div class="controls" style="margin-top:10px">
+        <select id="kv-keyspace" title="keyspace"></select>
+        <input id="kv-prefix" placeholder="prefix filter (e.g. user:)" />
+        <button class="ghost" onclick="scan()">Scan</button>
+      </div>
+      <div class="controls">
+        <input id="kv-key" placeholder="key" />
+        <input id="kv-value" placeholder="value" />
+        <button onclick="putKey()">Put</button>
+      </div>
+      <table><thead><tr><th>Key</th><th>Value</th><th></th></tr></thead>
+        <tbody id="kv-rows"><tr><td colspan="3" class="empty">Scan to list keys.</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- Messaging status -->
+    <div class="card">
+      <h2>Messaging</h2>
+      <h3 style="margin-top:14px">Pub/Sub Topics</h3>
+      <table><tbody id="topics"><tr><td class="empty">none configured</td></tr></tbody></table>
+      <h3 style="margin-top:16px">Queues</h3>
+      <table><tbody id="queues"><tr><td class="empty">none configured</td></tr></tbody></table>
+      <h3 style="margin-top:16px">Event Streams</h3>
+      <table><tbody id="streams"><tr><td class="empty">none configured</td></tr></tbody></table>
+      <div class="controls" style="margin-top:14px">
+        <input id="pub-topic" placeholder="topic" />
+        <input id="pub-msg" placeholder="message" />
+        <button onclick="publish()">Publish</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Keyspaces</h2>
+    <table>
+      <thead><tr><th>Name</th><th>Tier</th><th>Subscriptions</th><th>Last sequence</th><th>TTL keys</th></tr></thead>
+      <tbody id="keyspaces"></tbody>
+    </table>
+  </div>
+
+  <div class="muted" style="text-align:center;font-size:12px">
+    Auto-refreshes every 2s · REST API at <code>/kv</code>, <code>/topics</code>, <code>/queues</code>, <code>/streams</code> · Prometheus at <code>/metrics</code>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let apiKey = localStorage.getItem('falcon_key') || '';
+
+function headers() { return apiKey ? { 'Authorization': 'Bearer ' + apiKey } : {}; }
+async function api(path, opts={}) {
+  const r = await fetch(path, { ...opts, headers: { ...headers(), ...(opts.headers||{}) } });
+  if (r.status === 401) { const k = prompt('API key:'); if (k){ apiKey=k; localStorage.setItem('falcon_key',k);} throw new Error('auth'); }
+  return r;
+}
+function toast(msg) { const t=$('#toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1600); }
+
+// ---- Prometheus text parse (just the flat counters/gauges we show) ----
+function parseMetrics(text) {
+  const m = {};
+  for (const line of text.split('\n')) {
+    if (!line || line[0]==='#') continue;
+    const sp = line.lastIndexOf(' ');
+    if (sp<0) continue;
+    const name = line.slice(0,sp).trim();
+    if (name.includes('{')) continue; // skip histogram buckets
+    m[name] = Number(line.slice(sp+1));
+  }
+  return m;
+}
+
+const tiles = [
+  ['GET ops', 'falcon_kv_get_total'],
+  ['PUT ops', 'falcon_kv_put_total'],
+  ['DEL ops', 'falcon_kv_delete_total'],
+  ['GET hit rate', (m)=> {
+      const h=m.falcon_kv_get_hit_total||0, t=(m.falcon_kv_get_hit_total||0)+(m.falcon_kv_get_miss_total||0);
+      return t? Math.round(100*h/t)+'%':'—'; }],
+  ['WAL bytes', (m)=> human(m.falcon_wal_bytes||0)],
+  ['HTTP reqs', 'falcon_http_requests_total'],
+  ['WS subs', 'falcon_ws_subscriptions'],
+  ['Repl lag', 'falcon_replication_lag_sequences'],
+];
+function human(n){ if(n<1024)return n+' B'; if(n<1048576)return (n/1024).toFixed(1)+' KB'; if(n<1073741824)return (n/1048576).toFixed(1)+' MB'; return (n/1073741824).toFixed(1)+' GB'; }
+
+async function refresh() {
+  try {
+    const [hz, mt] = await Promise.all([
+      api('/healthz').then(r=>r.json()),
+      api('/metrics').then(r=>r.text()).then(parseMetrics),
+    ]);
+    // status
+    $('#node').textContent = hz.node_id + ' · ' + hz.region;
+    const rz = await api('/readyz'); const ready = rz.status===200;
+    $('#ready').innerHTML = `<span class="dot ${ready?'ok':'bad'}"></span>${ready?'ready':'not ready'}`;
+
+    // tiles
+    $('#tiles').innerHTML = tiles.map(([label,key])=>{
+      const v = typeof key==='function' ? key(mt) : fmtNum(mt[key]||0);
+      return `<div class="card"><h3>${label}</h3><div class="stat">${v}</div></div>`;
+    }).join('');
+
+    // components
+    const comp = hz.components||{};
+    const cmap = { falcon_db:'FalconDB', falcon_queue:'Queue', falcon_pubsub:'Pub/Sub', falcon_realtime_db:'Realtime DB' };
+    let compHtml = Object.entries(cmap).map(([k,label])=>
+      `<div class="card" style="text-align:center"><h3>${label}</h3><span class="pill ${comp[k]?'on':'off'}">${comp[k]?'active':'off'}</span></div>`).join('');
+    // streams presence from features
+    compHtml += `<div class="card" style="text-align:center"><h3>Event Streaming</h3><span class="pill ${(hz.features.streams>0)?'on':'off'}">${(hz.features.streams>0)?'active':'off'}</span></div>`;
+    compHtml += `<div class="card" style="text-align:center"><h3>Replication</h3><span class="pill ${comp&&hz.replication_enabled?'on':'off'}">${hz.replication_enabled?(hz.replication_role||'on'):'off'}</span></div>`;
+    $('#components').innerHTML = compHtml;
+
+    // keyspaces
+    $('#keyspaces').innerHTML = (hz.keyspaces||[]).map(k=>
+      `<tr><td>${k.name}</td><td><code>${k.tier}</code></td><td>${k.subscriptions_enabled?'✔':'—'}</td><td>${k.last_applied_sequence}</td><td>${k.ttl_tracked_keys}</td></tr>`).join('');
+    // keyspace selector
+    const sel = $('#kv-keyspace'); const cur = sel.value;
+    sel.innerHTML = (hz.keyspaces||[]).map(k=>`<option>${k.name}</option>`).join('');
+    if (cur) sel.value = cur;
+
+    // messaging lists
+    fillList('#topics', hz.topics, 'no topics');
+    fillList('#queues', hz.queues, 'no queues');
+    fillList('#streams', hz.streams, 'no streams');
+  } catch(e) { /* auth prompt or transient */ }
+}
+function fmtNum(n){ return n>=1000 ? n.toLocaleString() : n; }
+function fillList(sel, names, empty) {
+  const el = $(sel);
+  if (!names || !names.length) { el.innerHTML = `<tr><td class="empty">${empty}</td></tr>`; return; }
+  el.innerHTML = names.map(n=>`<tr><td>${n}</td></tr>`).join('');
+}
+
+async function scan() {
+  const ks = $('#kv-keyspace').value || 'default';
+  const prefix = encodeURIComponent($('#kv-prefix').value||'');
+  const r = await api(`/keyspaces/${ks}/kv?prefix=${prefix}`); const b = await r.json();
+  const rows = (b.items||[]);
+  $('#kv-rows').innerHTML = rows.length ? rows.map(it=>
+    `<tr><td>${esc(it.key)}</td><td class="val">${esc(it.value)}</td><td><button class="mini" onclick="delKey('${esc(it.key)}')">✕</button></td></tr>`).join('')
+    : `<tr><td colspan="3" class="empty">no keys${$('#kv-prefix').value?` for prefix "${esc($('#kv-prefix').value)}"`:''}</td></tr>`;
+}
+async function putKey() {
+  const ks = $('#kv-keyspace').value || 'default';
+  const key = $('#kv-key').value; if (!key) return toast('key required');
+  await api(`/keyspaces/${ks}/kv/${encodeURIComponent(key)}`, { method:'PUT', body: $('#kv-value').value });
+  toast('put ' + key); $('#kv-key').value=''; $('#kv-value').value=''; scan();
+}
+async function delKey(key) {
+  const ks = $('#kv-keyspace').value || 'default';
+  await api(`/keyspaces/${ks}/kv/${encodeURIComponent(key)}`, { method:'DELETE' });
+  toast('deleted ' + key); scan();
+}
+async function publish() {
+  const t = $('#pub-topic').value; if (!t) return toast('topic required');
+  const r = await api(`/topics/${encodeURIComponent(t)}/publish`, { method:'POST', body: $('#pub-msg').value });
+  if (r.ok) { toast('published'); $('#pub-msg').value=''; } else toast('publish failed ('+r.status+')');
+}
+function esc(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

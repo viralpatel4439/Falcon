@@ -1,10 +1,12 @@
 //! A storage engine that groups many keys into a small, fixed number of
 //! **buckets** (shards), storing each bucket as a single object in a backing
-//! [`ObjectStore`]. This is the answer to the cost problem of file-per-key:
-//! a third-party object store (S3-compatible or otherwise) bills *per
-//! request*, so one object per key means one billed PUT/GET per key. By
-//! hashing keys into `N` buckets and persisting one object per bucket,
-//! millions of keys cost `N` objects and `N` writes per flush — not millions.
+//! [`ObjectStore`] (a local directory today, a third-party bucket via the same
+//! trait tomorrow). This is Falcon's object-store tier, and it is designed to be
+//! cheap on request-billed stores: an S3-compatible store bills *per request*,
+//! so a naive "one object per key" layout would mean one billed PUT/GET per key.
+//! By hashing keys into `N` buckets and persisting one object per bucket,
+//! millions of keys cost `N` objects and `N` writes per flush — not millions —
+//! and it behaves identically on local disk and remote buckets.
 //!
 //! ## Strategy (shard / hash / bucket)
 //!

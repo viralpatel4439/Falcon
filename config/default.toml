@@ -41,7 +41,7 @@ enabled = false               # global default; override per keyspace below
 # Set data_dir to any path (local disk, mounted network/volume) to use that.
 [storage]
 data_dir = "./data"
-default_tier = "warm"          # "hot" | "warm" | "cold" | "tiered" | "file-per-key" | "sharded"
+default_tier = "warm"          # "hot" | "warm" | "cold" | "tiered" | "sharded"
 max_value_bytes = 67108864     # 64 MiB anti-OOM cap on a single value/PUT body;
                                # a larger PUT is rejected with 413. 0 disables.
 
@@ -87,27 +87,16 @@ write_mode = "single-leader"  # "single-leader" (default): one region writes,
 # replication = true
 #
 # [[keyspace]]
-# name = "blobs"
-# tier = "file-per-key"  # each value is an independent file under data_dir
-#                        # (one flat file per key, atomic write-rename). Simple,
-#                        # portable, inspectable. PORTABILITY TIER, NOT A HOT
-#                        # TIER: one I/O (or one billed request on a remote
-#                        # bucket) PER KEY, no in-memory index. For hot or
-#                        # cost-sensitive object storage use tier = "sharded"
-#                        # (below) instead — it's the optimized object-store
-#                        # engine (fixed object count, O(1) in-memory reads).
-# subscriptions = false
-# replication = false    # cannot be a replication LEADER (no ordered log)
-#
-# [[keyspace]]
 # name = "catalog"
-# tier = "sharded"       # keys are HASHED into a fixed set of buckets; each
-#                        # bucket is ONE object in the backing store. So N
-#                        # buckets = N objects no matter how many keys — the
-#                        # cheap way to use a 3rd-party (request-billed) object
-#                        # store, vs. file-per-key's one-object-per-key cost.
-#                        # In-memory index gives O(1) point reads; prefix scans
-#                        # sweep all buckets (hashing removes key locality).
+# tier = "sharded"       # OBJECT-STORE TIER (local disk today, third-party
+#                        # bucket via the same ObjectStore trait). Keys are
+#                        # HASHED into a fixed set of buckets; each bucket is ONE
+#                        # object in the backing store. So N buckets = N objects
+#                        # no matter how many keys — the cheap way to use a
+#                        # request-billed object store (one object per bucket,
+#                        # NOT one per key). In-memory index gives O(1) point
+#                        # reads; prefix scans sweep all buckets (hashing removes
+#                        # key locality).
 # shard_buckets = 4096    # number of buckets (rounded up to a power of two)
 # shard_flush_ms = 0      # 0 = flush the touched bucket every write (durable);
 #                         # >0 = coalesce dirty buckets and flush on this interval
