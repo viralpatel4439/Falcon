@@ -140,6 +140,9 @@ replication behaviour, metrics, and guarantees:
 [Cache](docs/cache.md) · [KV Store](docs/kv.md) · [Pub/Sub](docs/pubsub.md) ·
 [Queue](docs/queue.md) · [Event Stream](docs/stream.md).
 
+**Not sure which one you need?** See **[docs/compare.md](docs/compare.md)** — Cache
+vs. KV, Pub/Sub vs. Queue vs. Stream, a capability matrix, and when to use which.
+
 ### 1. Falcon Cache — low-latency cache with TTL
 
 RAM-first (tiered engine) with the cold tail spilled to disk, so it holds far
@@ -300,7 +303,7 @@ When several products run on **one node/container**, each keeps its files in its
 named resource in two products (e.g. a Pub/Sub topic and an Event Stream both
 called `events`) can never collide. Upgrading from an older flat layout migrates
 existing files into their new per-product directory automatically. See
-[`docs/README.md`](docs/README.md#storage-layout-one-directory-per-product).
+[`docs/architecture.md`](docs/architecture.md#one-directory-per-product-on-disk).
 
 There are exactly **two** storage kinds:
 
@@ -560,8 +563,8 @@ cargo build --release --no-default-features --features feat-cache
 ## Architecture
 
 Architecture is documented per product in [`docs/`](docs/). Start with
-[docs/README.md](docs/README.md) — its **shared foundation** section covers the
-pieces every product builds on (the single `ChangeEvent` write path, the
+[docs/architecture.md](docs/architecture.md) — its **shared foundation** section
+covers the pieces every product builds on (the single `ChangeEvent` write path, the
 group-commit WAL, the swappable `StorageEngine` tiers — hot / warm / cold /
 tiered / sharded, per-product storage directories, and the replication model).
 Each product doc then explains how it composes those primitives and **why**:

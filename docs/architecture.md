@@ -1,8 +1,9 @@
-# Falcon product documentation
+# Falcon architecture & product guide
 
-Falcon ships **five installable data products** behind one Rust binary. This
-directory has one document per product. Each doc is written to answer three
-questions, in order:
+The index for Falcon's documentation, plus the **shared architecture** every
+product is built on. Falcon ships **five installable data products** behind one
+Rust binary; this directory has one document per product, each written to answer
+three questions, in order:
 
 1. **What is it** — the product and its API surface (CLI, HTTP, wire).
 2. **How is it built** — the architecture: the data structures, the write/read
@@ -17,6 +18,10 @@ questions, in order:
 | **Falcon Pub/Sub** | `falcon install pubsub` | [pubsub.md](pubsub.md) | Broadcast fan-out over an optional durable append log |
 | **Falcon Queue** | `falcon install queue` | [queue.md](queue.md) | One durable log + per-group cursor and in-flight set (at-least-once) |
 | **Falcon Event Stream** | `falcon install stream` | [stream.md](stream.md) | Key-hashed partitions, each a durable log, with durable group offsets |
+
+**Not sure which product you need?** → **[compare.md](compare.md)** — the
+differences, the *why*, and *when* to use each (Cache vs. KV, Pub/Sub vs. Queue
+vs. Stream, a capability matrix, and worked scenarios).
 
 For the platform-wide picture — install/serve model, protocols, TLS, auth,
 multi-region replication, and benchmarks — see the top-level
