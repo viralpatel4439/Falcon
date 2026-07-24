@@ -112,7 +112,7 @@ async fn value_written_over_wire_is_visible_via_http() {
     // Same Node underneath, so the HTTP API must see it.
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("http://{}/kv/shared", server.http_addr))
+        .get(format!("http://{}/kv?key=shared", server.http_addr))
         .send()
         .await
         .unwrap();

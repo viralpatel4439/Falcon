@@ -391,6 +391,13 @@ pub struct KeyspaceConfig {
     /// writers. All non-single modes require a durable tier (warm) + replication.
     #[serde(default = "default_write_mode")]
     pub write_mode: WriteMode,
+    /// Subdirectory under `data_dir` this keyspace's files live in. Set per
+    /// product by the profile (`cache/`, `kv/`, …) so that when several products
+    /// run on one node their storage is isolated in separate directories rather
+    /// than sharing one flat `data_dir`. Empty = files sit directly in
+    /// `data_dir` (legacy layout; kept so hand-written configs behave as before).
+    #[serde(default)]
+    pub storage_subdir: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +436,7 @@ impl KeyspaceConfig {
             default_ttl_secs: 0,
             interval_fsync_ms: 0,
             write_mode: default_write_mode(),
+            storage_subdir: String::new(),
         }
     }
 }

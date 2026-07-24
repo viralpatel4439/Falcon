@@ -67,7 +67,7 @@
 <script>
 const KS = "cache";
 let apiKey = localStorage.getItem("falcon_key") || "";
-function hdrs(json){ const h={}; if(json) h["Content-Type"]="text/plain"; if(apiKey) h["Authorization"]="Bearer "+apiKey; return h; }
+function hdrs(json){ const h={}; if(json) h["Content-Type"]="application/json"; if(apiKey) h["Authorization"]="Bearer "+apiKey; return h; }
 async function ensureKey(res){ if(res.status===401){ const k=prompt("API key required:"); if(k){ apiKey=k; localStorage.setItem("falcon_key",k);} return true;} return false; }
 
 async function refresh(){
@@ -94,17 +94,17 @@ async function putKey(){
   const key=document.getElementById("setKey").value.trim(); if(!key) return;
   const val=document.getElementById("setVal").value;
   const ttl=document.getElementById("setTtl").value.trim();
-  let url=`/keyspaces/${KS}/kv/${encodeURIComponent(key)}`; if(ttl) url+=`?ttl=${ttl}`;
+  const body=JSON.stringify(ttl?{key,value:val,ttl:Number(ttl)}:{key,value:val});
   const o=document.getElementById("setOut");
-  let res=await fetch(url,{method:"PUT",headers:hdrs(true),body:val});
-  if(await ensureKey(res)) res=await fetch(url,{method:"PUT",headers:hdrs(true),body:val});
-  if(res.ok){ const b=await res.json(); o.innerHTML=`<span class="ok">cached</span> · seq ${b.sequence}`; refresh(); }
+  let res=await fetch("/cache",{method:"POST",headers:hdrs(true),body});
+  if(await ensureKey(res)) res=await fetch("/cache",{method:"POST",headers:hdrs(true),body});
+  if(res.ok){ o.innerHTML=`<span class="ok">cached</span>`; refresh(); }
   else o.innerHTML=`<span class="err">error ${res.status}</span>`;
 }
 async function getKey(){
   const key=document.getElementById("getKey").value.trim(); if(!key) return;
   const o=document.getElementById("getOut");
-  let res=await fetch(`/keyspaces/${KS}/kv/${encodeURIComponent(key)}`,{headers:hdrs()});
+  let res=await fetch(`/cache?key=${encodeURIComponent(key)}`,{headers:hdrs()});
   if(await ensureKey(res)) return getKey();
   if(res.status===404){ o.innerHTML=`<span class="err">miss</span> — not in cache`; return; }
   if(res.ok){ const b=await res.json(); o.innerHTML=`<span class="ok">hit</span>\n${b.value}`; }
@@ -112,7 +112,7 @@ async function getKey(){
 }
 async function delKey(){
   const key=document.getElementById("getKey").value.trim(); if(!key) return;
-  let res=await fetch(`/keyspaces/${KS}/kv/${encodeURIComponent(key)}`,{method:"DELETE",headers:hdrs()});
+  let res=await fetch(`/cache?key=${encodeURIComponent(key)}`,{method:"DELETE",headers:hdrs()});
   if(await ensureKey(res)) return delKey();
   document.getElementById("getOut").innerHTML = res.ok ? `<span class="ok">evicted</span>` : `<span class="err">error ${res.status}</span>`;
   refresh();

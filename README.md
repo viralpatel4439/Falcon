@@ -105,22 +105,26 @@ falcon serve
 ```
 
 ```bash
-# In another shell, use the same binary as a client:
-falcon put foo bar
-falcon get foo                   # → bar
-falcon scan --prefix user:
+# In another shell, use the same binary as a client. Store a durable record:
+falcon put "user:42" '{"name":"Ada Lovelace","email":"ada@example.com"}'
+falcon get "user:42"             # → {"name":"Ada Lovelace","email":"ada@example.com"}
+falcon scan --prefix user:       # every user record
 falcon status                    # what's installed + current config
 falcon health
 ```
 
 ```bash
-# …or over plain HTTP:
-curl -X PUT localhost:8080/kv/foo -d 'bar'
-curl localhost:8080/kv/foo
-curl -X PUT 'localhost:8080/kv/session?ttl=60' -d 'expires in 60s'
-curl 'localhost:8080/kv?prefix=user:'
-curl localhost:8080/health           # active products + feature set
+# …or over plain HTTP — one product = one URL, key+value in a JSON body:
+curl -X POST localhost:8080/kv -H 'content-type: application/json' \
+     -d '{"key":"user:42","value":"{\"name\":\"Ada Lovelace\"}"}'
+curl 'localhost:8080/kv?key=user:42'                   # → {"value":"{\"name\":\"Ada Lovelace\"}"}
+curl 'localhost:8080/kv/scan?prefix=user:'
+curl localhost:8080/health                             # active products + feature set
 ```
+
+> **Values are strings.** A value can be a number, string, or object — the
+> client JSON-stringifies it into `value` and parses it back on read, so the API
+> stays schema-free and you never manage keyspaces, partitions, or offsets.
 
 > Swap `kv` for `cache`, `pubsub`, `queue`, or `stream` — each serves its own UI
 > and only its own routes. See [Using each product](#using-each-product).
@@ -130,7 +134,11 @@ curl localhost:8080/health           # active products + feature set
 ## Using each product
 
 Every product is `install → serve → use it` (CLI, HTTP, or the UI at
-`http://localhost:8080/`).
+`http://localhost:8080/`). Each has a **dedicated document** in [`docs/`](docs/)
+covering its full CLI/HTTP/wire surface, configuration, on-disk storage location,
+replication behaviour, metrics, and guarantees:
+[Cache](docs/cache.md) · [KV Store](docs/kv.md) · [Pub/Sub](docs/pubsub.md) ·
+[Queue](docs/queue.md) · [Event Stream](docs/stream.md).
 
 ### 1. Falcon Cache — low-latency cache with TTL
 
@@ -141,12 +149,15 @@ more than RAM while serving the hot set at RAM speed. Keys can expire via TTL.
 falcon install cache && falcon serve
 ```
 ```bash
-# CLI (cache keyspace is "cache")
-falcon put session:42 '{"user":7}' --keyspace cache --ttl 300
-falcon get session:42 --keyspace cache
+# CLI (--cache targets the Cache product). Example: a login session that
+# auto-expires after 30 minutes — the classic use for a cache with TTL.
+falcon put "session:7f3a9c" '{"user":42,"role":"admin"}' --cache --ttl 1800
+falcon get "session:7f3a9c" --cache            # → {"user":42,"role":"admin"}
 
-# HTTP
-curl -X PUT 'localhost:8080/keyspaces/cache/kv/session:42?ttl=300' -d 'value'
+# HTTP — POST a JSON body; GET/DELETE by ?key=
+curl -X POST localhost:8080/cache -H 'content-type: application/json' \
+     -d '{"key":"session:7f3a9c","value":"{\"user\":42}","ttl":1800}'
+curl 'localhost:8080/cache?key=session:7f3a9c'                # → {"value":"..."}
 ```
 The UI shows hit-rate, hot keys/bytes, evictions, and TTL-tracked keys.
 
@@ -159,60 +170,70 @@ WebSocket updates — subscribe to a key prefix and every write is pushed to you
 falcon install kv && falcon serve
 ```
 ```bash
-falcon put user:7 'Alice'
-falcon get user:7
+falcon put "user:42" '{"name":"Ada Lovelace","plan":"pro"}'
+falcon get "user:42"
 falcon scan --prefix user:
 
-# Real-time updates over WebSocket:
-#   ws://localhost:8080/subscribe?keyspace=default&prefix=user:
+curl -X POST localhost:8080/kv -H 'content-type: application/json' \
+     -d '{"key":"user:42","value":"{\"name\":\"Ada Lovelace\"}"}'
+curl 'localhost:8080/kv?key=user:42'
+
+# Real-time updates over WebSocket — watch every user record change live:
+#   ws://localhost:8080/subscribe?prefix=user:
 ```
 The UI has read/write/scan plus a live subscription viewer.
 
 ### 3. Falcon Pub/Sub — topics (fan-out)
 
-Publish to a topic; every live subscriber gets it (at-most-once for ephemeral
-topics, persisted and replayable for durable ones).
+Publish; every live subscriber gets it (at-most-once for ephemeral topics,
+persisted and replayable for durable ones).
 
 ```bash
 falcon install pubsub && falcon serve
 ```
+# Broadcast an event every live subscriber reacts to (email, analytics, …):
 ```bash
-falcon topic publish events 'hello everyone'
-curl -X POST localhost:8080/topics/events/publish -d 'hello'
+falcon topic publish '{"event":"order.placed","order":1001}'
+curl -X POST localhost:8080/pubsub -H 'content-type: application/json' \
+     -d '{"value":"{\"event\":\"order.placed\",\"order\":1001}"}'
 # Subscribe:  ws://localhost:8080/subscribe?topic=events
 ```
 
 ### 4. Falcon Queue — durable work queues
 
-Push jobs; competing consumers in a group each pop different jobs (at-least-once
-with ack + redelivery-on-timeout). Work is distributed, not broadcast.
+Push jobs; competing workers each get different jobs (at-least-once with ack +
+redelivery-on-timeout). Work is distributed, not broadcast — use this when
+exactly one worker should handle each job.
 
 ```bash
 falcon install queue && falcon serve
 ```
 ```bash
-falcon queue push jobs 'resize-image:42'
-falcon queue pop jobs --group workers        # one consumer gets one job
+# Enqueue a background job; a pool of workers each pops a different one:
+falcon queue push '{"job":"resize-image","file":"photo42.jpg","w":800}'
+falcon queue pop                              # one worker gets one job
 
-curl -X POST localhost:8080/queues/jobs/push -d 'resize-image:42'
-curl -X POST 'localhost:8080/queues/jobs/pop?group=workers'
+curl -X POST localhost:8080/queue -H 'content-type: application/json' \
+     -d '{"value":"{\"job\":\"resize-image\",\"file\":\"photo42.jpg\"}"}'
+curl localhost:8080/queue                     # → {"id":1,"value":"..."} (then POST /queue/ack {id})
 ```
 
 ### 5. Falcon Event Stream — partitioned, replayable logs
 
-Kafka-shaped: records route to partitions by key (same key → same partition →
-totally ordered). Consumer groups keep a durable per-partition offset and resume
-where they left off; any group can replay history independently.
+Records with the same `key` stay in order; a simple consumer just reads the next
+batch in a loop. Ordering and replay are handled for you.
 
 ```bash
 falcon install stream && falcon serve
 ```
 ```bash
-falcon stream append clicks 'click:home' --key user:7    # key sets the partition
-falcon stream poll clicks --partition 0 --group analytics
+# A per-user activity stream — key = user id keeps that user's events ordered:
+falcon stream append '{"event":"page_view","path":"/home"}' --key user:42
+falcon stream next                                # read the next batch
 
-curl -X POST 'localhost:8080/streams/clicks/records?key=user:7' -d 'click:home'
-curl 'localhost:8080/streams/clicks/poll?group=analytics&partition=0'
+curl -X POST localhost:8080/stream -H 'content-type: application/json' \
+     -d '{"key":"user:42","value":"{\"event\":\"page_view\"}"}'
+curl localhost:8080/stream                        # → {"items":[{"value":"..."}]}
 ```
 
 ---
@@ -233,8 +254,15 @@ falcon status                            # installed products + build + settings
 ```
 
 `falcon serve` loads the profile; its flags (`--http-bind`, `--wire-bind`,
-`--node-id`, `--region`, `--data-dir`, `--worker-threads`, `--log-level`)
-override the profile **for one run**. Order: **profile < serve flags**.
+`--node-id`, `--region`, `--data-dir`, `--log-level`) override the profile **for
+one run**. Order: **profile < serve flags**.
+
+**Concurrency is automatic — there is no thread/worker/core knob.** On start,
+Falcon sizes a multi-threaded, work-stealing runtime to the machine: one async
+worker per logical CPU (so every subsystem runs across all cores) plus a
+separate elastic blocking pool that absorbs fsync/disk work without starving the
+async workers. The scheduler work-steals to balance load, so the runtime adapts
+to traffic on its own. The chosen worker/blocking counts are logged at startup.
 
 ### Config reference
 
@@ -266,9 +294,18 @@ knobs) is documented in [`config/default.toml`](config/default.toml).
 
 ## Storage: local disk or third-party
 
+When several products run on **one node/container**, each keeps its files in its
+**own subdirectory** under `data-dir` (`kv/`, `cache/`, `pubsub/`, `queue/`,
+`stream/`), so no two products ever share a storage directory — an identically
+named resource in two products (e.g. a Pub/Sub topic and an Event Stream both
+called `events`) can never collide. Upgrading from an older flat layout migrates
+existing files into their new per-product directory automatically. See
+[`docs/README.md`](docs/README.md#storage-layout-one-directory-per-product).
+
 There are exactly **two** storage kinds:
 
-- **`local`** (default) — data lives on local disk at `data-dir`.
+- **`local`** (default) — data lives on local disk at `data-dir`, one
+  subdirectory per product.
 - **`remote`** — a third-party object store you fully specify. Falcon ships
   **no provider defaults** and hardcodes nothing; you supply the endpoint and
   everything needed to sign a request. Because the object HTTP API (as
@@ -465,11 +502,11 @@ connections/writers at once), so they reflect real capacity, not single-thread.
 
 | Path | Throughput | p50 | p99 |
 |------|-----------:|----:|----:|
-| Wire GET, pipeline depth=128 | **9.29 M ops/sec** | 100 µs¹ | 191 µs¹ |
+| Wire GET, pipeline depth=128 | **8.59 M ops/sec** | 106 µs¹ | 200 µs¹ |
 | Wire GET, pipeline depth=16 | **2.30 M ops/sec** | 53 µs¹ | 99 µs¹ |
-| Wire GET, depth=1 (no pipeline) | 184 K ops/sec | 42 µs | 80 µs |
-| Sustained read load (64 conns, depth=16) | **3.01 M ops/sec** | 329 µs¹ | 622 µs¹ |
-| HTTP GET (JSON, 1 req/op) | 80 K ops/sec | 86 µs | 238 µs |
+| Wire GET, depth=1 (no pipeline) | 181 K ops/sec | 42 µs | 88 µs |
+| Sustained read load (64 conns, depth=16) | **2.98 M ops/sec** | 330 µs¹ | 638 µs¹ |
+| HTTP GET (JSON, 1 req/op) | 80 K ops/sec | 86 µs | 205 µs |
 
 ¹ *In the pipelined rows, latency percentiles are **per batch** (batch = `depth`
 ops); throughput is aggregate.* The sustained read test reported **STABLE (no
@@ -483,23 +520,23 @@ window for far higher throughput.
 
 | Write mode | Throughput | p50 | p99 |
 |------------|-----------:|----:|----:|
-| `fsync` every write (max durability) | ~1 K ops/sec | 7 ms | 12 ms |
-| `interval_fsync_ms = 10` (≤10 ms loss window, 64 conns) | **406 K ops/sec** | 1 ms | 5 ms |
+| `fsync` every write (max durability, HTTP 1 req/op) | ~980 ops/sec | 7 ms | 12 ms |
+| `interval_fsync_ms = 10` (≤10 ms loss window, 64 conns) | **393 K ops/sec** | 1 ms | 5 ms |
 
 The interval-fsync write test reported **STABLE**.
 
-### Every product (`falcon-bench --bench-all`, 5000 records each)
+### Every product (`falcon-bench --bench-all`, 2000 records each)
 
 Each row also passed its correctness checks.
 
 | Product | Concurrent peak | Per-op latency (sequential, durable) | Correctness verified |
 |---------|----------------:|--------------------------------------|----------------------|
-| **Falcon KV Store** | ~2,450 ops/sec | p50 3.4 ms · p99 4.1 ms | 5000/5000 survived a hard restart |
-| **Falcon Pub/Sub** | **~4,900 ops/sec** | — | ordered; persisted across restart |
-| **Falcon Queue** | ~4,270 ops/sec | p50 357 µs · p99 575 µs | 5000/5000 delivered; acked jobs not redelivered |
-| **Falcon Event Stream** | ~4,260 ops/sec | — | per-key ordered; resumes at committed offset |
-| **Falcon KV Store (real-time)** | ~2,260 ops/sec | p50 4.0 ms · p99 4.2 ms | 640/640 writes notified (32 subs), no drops/dupes |
-| **Multi-region** (leader→follower, 16 writers) | ~880 ops/sec | — | 496/496 converged, none lost; batch converged in ~1.6 s |
+| **Falcon KV Store** | ~2,120 ops/sec | p50 3.9 ms · p99 4.1 ms | 2000/2000 survived a hard restart |
+| **Falcon Pub/Sub** | **~4,550 ops/sec** | — | ordered; persisted across restart |
+| **Falcon Queue** | ~4,270 ops/sec | p50 154 µs · p99 416 µs | 2000/2000 delivered; acked jobs not redelivered |
+| **Falcon Event Stream** | ~4,340 ops/sec | — | per-key ordered; resumes at committed offset |
+| **Falcon KV Store (real-time)** | ~2,310 ops/sec | p50 4.0 ms · p99 4.3 ms | 640/640 writes notified (32 subs), no drops/dupes |
+| **Multi-region** (leader→follower, 16 writers) | ~930 ops/sec | — | 320/320 converged, none lost; batch converged in ~1.0 s |
 
 *Multi-region throughput reflects cross-region convergence over async gRPC, not
 per-write latency; both nodes persist independently.*
@@ -522,9 +559,14 @@ cargo build --release --no-default-features --features feat-cache
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the crate map, the storage engines
-(hot / warm / cold / tiered / sharded), the group-commit WAL, the replication
-model, and the request lifecycle.
+Architecture is documented per product in [`docs/`](docs/). Start with
+[docs/README.md](docs/README.md) — its **shared foundation** section covers the
+pieces every product builds on (the single `ChangeEvent` write path, the
+group-commit WAL, the swappable `StorageEngine` tiers — hot / warm / cold /
+tiered / sharded, per-product storage directories, and the replication model).
+Each product doc then explains how it composes those primitives and **why**:
+[Cache](docs/cache.md) · [KV Store](docs/kv.md) · [Pub/Sub](docs/pubsub.md) ·
+[Queue](docs/queue.md) · [Event Stream](docs/stream.md).
 
 ## License
 

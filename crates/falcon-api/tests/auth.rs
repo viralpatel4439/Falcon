@@ -28,7 +28,7 @@ async fn auth_off_by_default_allows_everything() {
     // token empty -> auth off
     let addr = start(config).await;
     let client = reqwest::Client::new();
-    let resp = client.put(format!("http://{addr}/kv/k")).body("v").send().await.unwrap();
+    let resp = client.post(format!("http://{addr}/kv")).json(&serde_json::json!({"key":"k","value":"v"})).send().await.unwrap();
     assert!(resp.status().is_success());
 }
 
@@ -39,12 +39,12 @@ async fn auth_on_rejects_missing_and_wrong_token() {
     let client = reqwest::Client::new();
 
     // No token -> 401.
-    let resp = client.get(format!("http://{addr}/kv/k")).send().await.unwrap();
+    let resp = client.get(format!("http://{addr}/kv?key=k")).send().await.unwrap();
     assert_eq!(resp.status(), 401);
 
     // Wrong token -> 401.
     let resp = client
-        .get(format!("http://{addr}/kv/k"))
+        .get(format!("http://{addr}/kv?key=k"))
         .bearer_auth("wrong")
         .send()
         .await
@@ -64,9 +64,9 @@ async fn auth_on_allows_correct_token_and_healthz_is_exempt() {
 
     // Correct token -> allowed.
     let resp = client
-        .put(format!("http://{addr}/kv/k"))
+        .post(format!("http://{addr}/kv"))
         .bearer_auth("s3cret")
-        .body("v")
+        .json(&serde_json::json!({"key":"k","value":"v"}))
         .send()
         .await
         .unwrap();
@@ -82,21 +82,21 @@ async fn api_key_via_query_param_works() {
     let client = reqwest::Client::new();
 
     let ok = client
-        .put(format!("http://{addr}/kv/k?api_key=s3cret"))
-        .body("v")
+        .post(format!("http://{addr}/kv?api_key=s3cret"))
+        .json(&serde_json::json!({"key":"k","value":"v"}))
         .send()
         .await
         .unwrap();
     assert!(ok.status().is_success(), "valid ?api_key should be accepted");
 
     let bad = client
-        .get(format!("http://{addr}/kv/k?api_key=wrong"))
+        .get(format!("http://{addr}/kv?key=k&api_key=wrong"))
         .send()
         .await
         .unwrap();
     assert_eq!(bad.status(), 401, "wrong ?api_key must be rejected");
 
-    let missing = client.get(format!("http://{addr}/kv/k")).send().await.unwrap();
+    let missing = client.get(format!("http://{addr}/kv?key=k")).send().await.unwrap();
     assert_eq!(missing.status(), 401);
 }
 

@@ -126,8 +126,8 @@ async fn wait_for_ready(base_url: &str) -> Result<()> {
 
 pub async fn put(client: &reqwest::Client, base_url: &str, key: &str, value: &[u8]) {
     let resp = client
-        .put(format!("{base_url}/kv/{key}"))
-        .body(value.to_vec())
+        .post(format!("{base_url}/kv"))
+        .json(&serde_json::json!({ "key": key, "value": String::from_utf8_lossy(value) }))
         .send()
         .await
         .expect("kvstored PUT request failed");
@@ -136,7 +136,7 @@ pub async fn put(client: &reqwest::Client, base_url: &str, key: &str, value: &[u
 
 pub async fn get(client: &reqwest::Client, base_url: &str, key: &str) {
     let resp = client
-        .get(format!("{base_url}/kv/{key}"))
+        .get(format!("{base_url}/kv?key={key}"))
         .send()
         .await
         .expect("kvstored GET request failed");

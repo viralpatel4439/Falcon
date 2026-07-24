@@ -495,6 +495,9 @@ impl Profile {
                     name: "cache".into(),
                     tier: if on_remote { TierName::Sharded } else { TierName::Tiered },
                     replication: replicated && !on_remote,
+                    // Own subdirectory so a cache co-located with other products
+                    // never shares a storage directory with them.
+                    storage_subdir: Feature::Cache.as_str().into(),
                     ..KeyspaceConfig::default_keyspace()
                 }),
                 Feature::Kv => cfg.keyspaces.push(KeyspaceConfig {
@@ -503,6 +506,7 @@ impl Profile {
                     subscriptions: true,
                     replication: replicated && !on_remote,
                     write_mode: kv_write_mode,
+                    storage_subdir: Feature::Kv.as_str().into(),
                     ..KeyspaceConfig::default_keyspace()
                 }),
                 Feature::Pubsub => cfg.topics.push(TopicConfig {
@@ -567,6 +571,21 @@ mod tests {
             p.set("nope", "x"),
             Err(ProfileError::UnknownKey(_))
         ));
+    }
+
+    #[test]
+    fn each_product_keyspace_gets_its_own_storage_subdir() {
+        // Cache and KV co-located on one node must land in DIFFERENT storage
+        // subdirectories so they never share a directory on the container.
+        let mut p = Profile::default();
+        p.features.insert(Feature::Cache);
+        p.features.insert(Feature::Kv);
+        let cfg = p.to_config();
+        let cache = cfg.keyspaces.iter().find(|k| k.name == "cache").unwrap();
+        let kv = cfg.keyspaces.iter().find(|k| k.name == "default").unwrap();
+        assert_eq!(cache.storage_subdir, "cache");
+        assert_eq!(kv.storage_subdir, "kv");
+        assert_ne!(cache.storage_subdir, kv.storage_subdir);
     }
 
     #[test]

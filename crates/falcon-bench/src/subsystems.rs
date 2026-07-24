@@ -128,7 +128,7 @@ const BIN: &str = "target/release/falcon";
 /// Count keys with a given prefix on a node via one REST scan.
 async fn scan_count(http: &reqwest::Client, base_url: &str, prefix: &str) -> Result<usize> {
     let resp = http
-        .get(format!("{base_url}/kv?prefix={prefix}"))
+        .get(format!("{base_url}/kv/scan?prefix={prefix}"))
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -174,7 +174,7 @@ pub async fn bench_kv(records: usize, value_size: usize) -> Result<SubResult> {
     // SAFE: every written key reads back with the right value now.
     let mut ok = 0;
     for k in &keys {
-        let got = reqwest::get(format!("{}/kv/{k}", handle.base_url)).await?;
+        let got = reqwest::get(format!("{}/kv?key={k}", handle.base_url)).await?;
         if got.status().is_success() {
             ok += 1;
         }
@@ -190,7 +190,7 @@ pub async fn bench_kv(records: usize, value_size: usize) -> Result<SubResult> {
     let handle2 = KvStoreHandle::spawn(BIN, port, dir.path()).await?;
     let mut survived = 0;
     for k in &keys {
-        let got = reqwest::get(format!("{}/kv/{k}", handle2.base_url)).await?;
+        let got = reqwest::get(format!("{}/kv?key={k}", handle2.base_url)).await?;
         if got.status().is_success() {
             survived += 1;
         }
@@ -402,51 +402,40 @@ pub async fn bench_stream(records: usize) -> Result<SubResult> {
         prev = *off;
     }
 
-    // SAFE: poll the full stream back via REST; count must match.
+    // SAFE: read the full stream back via the simple REST API. `GET /stream`
+    // returns the next batch across all partitions and commits it, so a single
+    // read drains every appended record.
     let http = reqwest::Client::new();
-    let poll: serde_json::Value = http
-        .get(format!(
-            "{}/streams/events/poll?group=g1&partition={partition}",
-            handle.base_url
-        ))
+    let batch: serde_json::Value = http
+        .get(format!("{}/stream", handle.base_url))
         .send()
         .await?
         .json()
         .await?;
-    let got = poll["records"].as_array().map(|a| a.len()).unwrap_or(0);
+    let got = batch["items"].as_array().map(|a| a.len()).unwrap_or(0);
     if got != records {
-        bail!("stream safe check failed: polled {got}/{records}");
+        bail!("stream safe check failed: read {got}/{records}");
     }
-    // Commit halfway, so the resume point is durable.
-    let mid = (records / 2) as u64;
-    http.post(format!(
-        "{}/streams/events/commit?group=g1&partition={partition}&offset={mid}",
-        handle.base_url
-    ))
-    .send()
-    .await?;
 
-    // DURABLE: restart; the group resumes strictly after its committed offset.
+    // DURABLE: that read committed the consumer's position. Restart the server
+    // on the SAME data dir; the group must resume strictly after what it read,
+    // so a second read returns nothing.
     drop(handle);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let handle2 = KvStoreHandle::spawn_with_config(BIN, port, dir.path(), cfg).await?;
-    let poll2: serde_json::Value = http
-        .get(format!(
-            "{}/streams/events/poll?group=g1&partition={partition}",
-            handle2.base_url
-        ))
+    let batch2: serde_json::Value = http
+        .get(format!("{}/stream", handle2.base_url))
         .send()
         .await?
         .json()
         .await?;
-    let remaining = poll2["records"].as_array().map(|a| a.len()).unwrap_or(0);
-    let expected = records - mid as usize;
-    if remaining != expected {
+    let remaining = batch2["items"].as_array().map(|a| a.len()).unwrap_or(0);
+    if remaining != 0 {
         bail!(
-            "stream durability check failed: after restart+commit, {remaining} left, expected {expected}"
+            "stream durability check failed: after restart, {remaining} redelivered, expected 0 (committed offset not durable)"
         );
     }
-    let durable = format!("resumed after commit: {remaining} of {records} left, exactly as committed");
+    let durable = format!("resumed after commit: 0 of {records} redelivered, exactly as committed");
 
     // Latency isn't per-record here (batched append); report append batch cost.
     let (p50, p99, max) = (0, 0, 0);
@@ -499,7 +488,7 @@ pub async fn bench_realtime(events: usize) -> Result<SubResult> {
     let mut lat = Vec::with_capacity(lat_events);
     for i in 0..lat_events {
         let t = Instant::now();
-        http.put(format!("{base}/kv/rt")).body(format!("v{i}")).send().await?;
+        http.post(format!("{base}/kv")).json(&serde_json::json!({"key":"rt","value":format!("v{i}")})).send().await?;
         loop {
             match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
                 Ok(Some(Ok(Message::Text(m)))) if m.contains("update") => break,
@@ -532,7 +521,7 @@ pub async fn bench_realtime(events: usize) -> Result<SubResult> {
             let http = reqwest::Client::new();
             let mut notified = 0usize;
             for i in 0..per_conn {
-                http.put(format!("{base}/kv/{key}")).body(format!("v{i}")).send().await?;
+                http.post(format!("{base}/kv")).json(&serde_json::json!({"key":key,"value":format!("v{i}")})).send().await?;
                 loop {
                     match tokio::time::timeout(Duration::from_secs(3), ws.next()).await {
                         Ok(Some(Ok(Message::Text(m)))) if m.contains("update") => {
@@ -615,8 +604,8 @@ pub async fn bench_multiregion(writes: usize) -> Result<SubResult> {
         writers.push(tokio::spawn(async move {
             let http = reqwest::Client::new();
             for i in 0..per_conn {
-                http.put(format!("{leader_url}/kv/r{c}_{i}"))
-                    .body(format!("v{i}"))
+                http.post(format!("{leader_url}/kv"))
+                    .json(&serde_json::json!({"key":format!("r{c}_{i}"),"value":format!("v{i}")}))
                     .send()
                     .await?;
             }

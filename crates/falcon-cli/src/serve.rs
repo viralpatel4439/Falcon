@@ -5,8 +5,13 @@
 //! The `serve` flags may override individual fields for a single run, but the
 //! profile remains the durable source of truth.
 //!
-//! Builds an explicit multi-threaded Tokio runtime (one worker per logical CPU
-//! by default) so every active subsystem runs concurrently across all cores.
+//! Concurrency is **automatic**. Falcon builds a multi-threaded, work-stealing
+//! Tokio runtime sized to the machine — there is no thread/worker/core knob to
+//! tune. The async worker pool gets one thread per logical CPU (so every active
+//! subsystem runs across all cores), and a separate, elastic blocking pool
+//! absorbs the blocking work (WAL/sled fsyncs) without ever starving the async
+//! workers. The scheduler load-balances tasks across workers by work-stealing,
+//! so the runtime adapts to load on its own rather than to a fixed setting.
 
 use crate::cli::ServeArgs;
 use crate::features;
@@ -14,6 +19,44 @@ use crate::replication;
 use falcon_core::{Config, FeatureSet, Node, Profile};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// How Falcon auto-sized the runtime for this machine. Logged at startup so the
+/// chosen concurrency is transparent even though it isn't configurable.
+#[derive(Clone, Copy)]
+struct RuntimePlan {
+    /// Async worker threads = logical CPUs. One per core → all cores usable.
+    workers: usize,
+    /// Upper bound on the elastic blocking pool (fsync/sled offload). Scaled to
+    /// core count with a floor, so a busy blocking path can't stall the async
+    /// workers, while an idle node keeps few threads parked.
+    max_blocking: usize,
+}
+
+impl RuntimePlan {
+    /// Derive the plan purely from the hardware — no user input.
+    fn detect() -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        // Blocking work is bursty (a batch of fsyncs), so allow more blocking
+        // threads than cores, with a sane floor for low-core machines.
+        let max_blocking = (workers * 4).max(8);
+        Self {
+            workers,
+            max_blocking,
+        }
+    }
+
+    /// Build the multi-threaded runtime this plan describes.
+    fn build(self) -> std::io::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(self.workers)
+            .max_blocking_threads(self.max_blocking)
+            .thread_name("falcon-worker")
+            .build()
+    }
+}
 
 pub fn run(profile_flag: &Option<String>, args: ServeArgs) -> anyhow::Result<()> {
     // Advanced/testing path: a full engine config file bypasses the profile.
@@ -62,18 +105,9 @@ pub fn run(profile_flag: &Option<String>, args: ServeArgs) -> anyhow::Result<()>
     let active = profile.features.clone();
     let config = build_config(&profile, &args)?;
 
-    let mut rt = tokio::runtime::Builder::new_multi_thread();
-    rt.enable_all();
-    if let Some(n) = args.worker_threads.filter(|&n| n > 0) {
-        rt.worker_threads(n);
-    }
-    let runtime = rt.build()?;
-    let workers = args
-        .worker_threads
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
-
-    runtime.block_on(async move { serve(config, active, profile_path, workers).await })
+    let plan = RuntimePlan::detect();
+    let runtime = plan.build()?;
+    runtime.block_on(async move { serve(config, active, profile_path, plan).await })
 }
 
 /// Serve from a full engine config TOML (the `--config` escape hatch). Derives
@@ -117,18 +151,10 @@ fn run_from_config_file(cfg_path: &str, args: &ServeArgs) -> anyhow::Result<()> 
         active.insert(Feature::Stream);
     }
 
-    let mut rt = tokio::runtime::Builder::new_multi_thread();
-    rt.enable_all();
-    if let Some(n) = args.worker_threads.filter(|&n| n > 0) {
-        rt.worker_threads(n);
-    }
-    let runtime = rt.build()?;
-    let workers = args
-        .worker_threads
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    let plan = RuntimePlan::detect();
+    let runtime = plan.build()?;
     let profile_path = falcon_core::default_profile_path();
-    runtime.block_on(async move { serve(config, active, profile_path, workers).await })
+    runtime.block_on(async move { serve(config, active, profile_path, plan).await })
 }
 
 /// Turn the profile into a runtime `Config`, then apply any one-run `serve`
@@ -163,15 +189,16 @@ async fn serve(
     config: Config,
     active: FeatureSet,
     profile_path: PathBuf,
-    workers: usize,
+    plan: RuntimePlan,
 ) -> anyhow::Result<()> {
     tracing::info!(
         node_id = %config.node.id,
         region = %config.node.region,
         products = %active,
         data_dir = %config.storage.data_dir,
-        worker_threads = workers,
-        "starting Falcon (multi-core)"
+        worker_threads = plan.workers,
+        max_blocking_threads = plan.max_blocking,
+        "starting Falcon (auto-sized runtime: one async worker per core, elastic blocking pool)"
     );
 
     let node = Arc::new(Node::build(config.clone())?);

@@ -183,9 +183,6 @@ pub struct ServeArgs {
     pub region: Option<String>,
     #[arg(long)]
     pub data_dir: Option<String>,
-    /// Tokio worker threads (multi-core). 0 or unset = one per logical CPU.
-    #[arg(long)]
-    pub worker_threads: Option<usize>,
     #[arg(long, default_value = "info")]
     pub log_level: String,
 }
@@ -205,9 +202,9 @@ pub struct ClientArgs {
 #[derive(Args, Debug, Clone)]
 pub struct KeyArgs {
     pub key: String,
-    /// Keyspace (default: "default").
-    #[arg(long, default_value = "default")]
-    pub keyspace: String,
+    /// Target the Cache product (`/cache`) instead of the KV Store (`/kv`).
+    #[arg(long)]
+    pub cache: bool,
     #[command(flatten)]
     pub client: ClientArgs,
 }
@@ -217,11 +214,12 @@ pub struct PutArgs {
     pub key: String,
     /// The value. If omitted, read from stdin.
     pub value: Option<String>,
-    #[arg(long, default_value = "default")]
-    pub keyspace: String,
     /// Optional TTL in seconds.
     #[arg(long)]
     pub ttl: Option<u64>,
+    /// Target the Cache product (`/cache`) instead of the KV Store (`/kv`).
+    #[arg(long)]
+    pub cache: bool,
     #[command(flatten)]
     pub client: ClientArgs,
 }
@@ -230,19 +228,16 @@ pub struct PutArgs {
 pub struct ScanArgs {
     #[arg(long, default_value = "")]
     pub prefix: String,
-    #[arg(long, default_value = "default")]
-    pub keyspace: String,
     #[command(flatten)]
     pub client: ClientArgs,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum TopicCmd {
-    /// Publish a payload to a topic.
+    /// Publish a value to the node's topic.
     Publish {
-        topic: String,
-        /// Payload; if omitted, read from stdin.
-        payload: Option<String>,
+        /// Value; if omitted, read from stdin.
+        value: Option<String>,
         #[command(flatten)]
         client: ClientArgs,
     },
@@ -250,18 +245,14 @@ pub enum TopicCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum QueueCmd {
-    /// Push a job onto a queue.
+    /// Push a job onto the queue.
     Push {
-        queue: String,
-        payload: Option<String>,
+        value: Option<String>,
         #[command(flatten)]
         client: ClientArgs,
     },
-    /// Pop (and auto-ack) one job from a queue for a consumer group.
+    /// Dequeue (and auto-ack) one job.
     Pop {
-        queue: String,
-        #[arg(long, default_value = "cli")]
-        group: String,
         #[command(flatten)]
         client: ClientArgs,
     },
@@ -269,22 +260,16 @@ pub enum QueueCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum StreamCmd {
-    /// Append a record to a stream, routed by --key.
+    /// Append a record to the stream, optionally routed by --key.
     Append {
-        stream: String,
-        payload: Option<String>,
+        value: Option<String>,
         #[arg(long, default_value = "")]
         key: String,
         #[command(flatten)]
         client: ClientArgs,
     },
-    /// Poll a partition for a consumer group (records after its commit).
-    Poll {
-        stream: String,
-        #[arg(long)]
-        partition: usize,
-        #[arg(long, default_value = "cli")]
-        group: String,
+    /// Read the next batch of records from the stream.
+    Next {
         #[command(flatten)]
         client: ClientArgs,
     },

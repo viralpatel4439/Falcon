@@ -36,8 +36,7 @@
   <div class="panel">
     <h2>Publish</h2>
     <div class="row">
-      <input id="topic" placeholder="topic (e.g. events)" style="max-width:220px" />
-      <input id="payload" placeholder="message payload" />
+      <input id="payload" placeholder="message value" />
       <button onclick="publish()">Publish</button>
     </div>
     <div class="out" id="pubOut" style="margin-top:12px"></div>
@@ -45,7 +44,6 @@
   <div class="panel">
     <h2>Live subscription <span class="tick" id="subState"></span></h2>
     <div class="row">
-      <input id="subTopic" placeholder="topic to watch" style="max-width:220px" />
       <button onclick="subscribe()">Subscribe</button>
       <button onclick="clearLog()" style="background:transparent;color:var(--fg);border:1px solid var(--border)">Clear</button>
     </div>
@@ -54,7 +52,7 @@
 </main>
 <script>
 let apiKey = localStorage.getItem("falcon_key") || "";
-function hdrs(json){const h={};if(json)h["Content-Type"]="text/plain";if(apiKey)h["Authorization"]="Bearer "+apiKey;return h;}
+function hdrs(json){const h={};if(json)h["Content-Type"]="application/json";if(apiKey)h["Authorization"]="Bearer "+apiKey;return h;}
 async function refresh(){
   try{ const h=await (await fetch("/health")).json();
     document.getElementById("nodeBadge").textContent=h.node_id+" · "+h.region+(h.replication_enabled?" · repl":"");
@@ -62,24 +60,22 @@ async function refresh(){
   }catch(e){ document.getElementById("nodeBadge").textContent="offline"; }
 }
 async function publish(){
-  const t=document.getElementById("topic").value.trim(); if(!t) return;
   const p=document.getElementById("payload").value;
   const o=document.getElementById("pubOut");
-  let res=await fetch(`/topics/${encodeURIComponent(t)}/publish`,{method:"POST",headers:hdrs(true),body:p});
+  let res=await fetch("/pubsub",{method:"POST",headers:hdrs(true),body:JSON.stringify({value:p})});
   if(res.status===401){const k=prompt("API key:");if(k){apiKey=k;localStorage.setItem("falcon_key",k);return publish();}}
-  if(res.ok){const b=await res.json();o.innerHTML=`<span class="ok">published</span> · offset ${b.offset??0}`;}
+  if(res.ok){o.innerHTML=`<span class="ok">published</span>`;}
   else o.innerHTML=`<span class="err">error ${res.status}</span>`;
 }
 let ws=null;
 function subscribe(){
-  const t=document.getElementById("subTopic").value.trim(); if(!t) return;
   if(ws) ws.close();
   const proto=location.protocol==="https:"?"wss":"ws";
-  let url=`${proto}://${location.host}/subscribe?topic=${encodeURIComponent(t)}`;
+  let url=`${proto}://${location.host}/subscribe?topic=events`;
   if(apiKey) url+=`&api_key=${encodeURIComponent(apiKey)}`;
   ws=new WebSocket(url);
   const st=document.getElementById("subState");
-  ws.onopen=()=>st.textContent="● live on "+t;
+  ws.onopen=()=>st.textContent="● live";
   ws.onclose=()=>st.textContent="○ closed";
   ws.onerror=()=>st.textContent="⚠ error";
   ws.onmessage=e=>{const l=document.getElementById("log"); l.textContent = `${new Date().toLocaleTimeString()}  ${e.data}\n`+l.textContent;};

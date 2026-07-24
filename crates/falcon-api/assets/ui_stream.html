@@ -33,27 +33,23 @@
   <div class="panel">
     <h2>Append a record</h2>
     <div class="row">
-      <input id="stream" placeholder="stream" style="max-width:180px" />
-      <input id="key" placeholder="partition key (optional)" style="max-width:200px" />
-      <input id="payload" placeholder="record payload" />
+      <input id="key" placeholder="key (optional, keeps same-key order)" style="max-width:260px" />
+      <input id="payload" placeholder="record value" />
       <button onclick="append()">Append</button>
     </div>
     <div class="out" id="appendOut" style="margin-top:12px"></div>
   </div>
   <div class="panel">
-    <h2>Poll a partition</h2>
+    <h2>Read next records</h2>
     <div class="row">
-      <input id="pollStream" placeholder="stream" style="max-width:180px" />
-      <input id="partition" placeholder="partition" value="0" style="max-width:120px" />
-      <input id="group" placeholder="group" value="ui" style="max-width:140px" />
-      <button onclick="poll()">Poll</button>
+      <button onclick="poll()">Read next</button>
     </div>
     <div class="out" id="pollOut" style="margin-top:12px"></div>
   </div>
 </main>
 <script>
 let apiKey=localStorage.getItem("falcon_key")||"";
-function hdrs(json){const h={};if(json)h["Content-Type"]="text/plain";if(apiKey)h["Authorization"]="Bearer "+apiKey;return h;}
+function hdrs(json){const h={};if(json)h["Content-Type"]="application/json";if(apiKey)h["Authorization"]="Bearer "+apiKey;return h;}
 async function refresh(){
   try{const h=await (await fetch("/health")).json();
     document.getElementById("nodeBadge").textContent=h.node_id+" · "+h.region+(h.replication_enabled?" · repl":"");
@@ -61,23 +57,19 @@ async function refresh(){
   }catch(e){document.getElementById("nodeBadge").textContent="offline";}
 }
 async function append(){
-  const s=document.getElementById("stream").value.trim(); if(!s) return;
   const k=document.getElementById("key").value.trim(); const p=document.getElementById("payload").value;
   const o=document.getElementById("appendOut");
-  let res=await fetch(`/streams/${encodeURIComponent(s)}/records?key=${encodeURIComponent(k)}`,{method:"POST",headers:hdrs(true),body:p});
+  let res=await fetch("/stream",{method:"POST",headers:hdrs(true),body:JSON.stringify({key:k,value:p})});
   if(res.status===401){const kk=prompt("API key:");if(kk){apiKey=kk;localStorage.setItem("falcon_key",kk);return append();}}
-  if(res.ok){const b=await res.json();o.innerHTML=`<span class="ok">appended</span> · partition ${b.partition??0}, offset ${b.offset??0}`;}
+  if(res.ok){o.innerHTML=`<span class="ok">appended</span>`;}
   else o.innerHTML=`<span class="err">error ${res.status}</span>`;
 }
 async function poll(){
-  const s=document.getElementById("pollStream").value.trim(); if(!s) return;
-  const part=document.getElementById("partition").value.trim()||"0";
-  const g=document.getElementById("group").value.trim()||"ui";
   const o=document.getElementById("pollOut");
-  let res=await fetch(`/streams/${encodeURIComponent(s)}/poll?group=${encodeURIComponent(g)}&partition=${part}`,{headers:hdrs()});
+  let res=await fetch("/stream",{headers:hdrs()});
   if(res.status===401){const k=prompt("API key:");if(k){apiKey=k;localStorage.setItem("falcon_key",k);return poll();}}
-  if(res.ok){const b=await res.json();const recs=b.records||[];
-    o.textContent = recs.length ? recs.map(r=>`offset ${r.offset}  ${r.payload}`).join("\n") : "(no new records)";
+  if(res.ok){const b=await res.json();const recs=b.items||[];
+    o.textContent = recs.length ? recs.map(r=>r.value).join("\n") : "(no new records)";
   } else o.innerHTML=`<span class="err">error ${res.status}</span>`;
 }
 refresh(); setInterval(refresh,5000);

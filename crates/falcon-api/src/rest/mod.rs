@@ -1,5 +1,4 @@
 pub mod config;
 pub mod error;
 pub mod handlers;
-pub mod messaging;
-pub mod streams;
+pub mod simple;

@@ -32,7 +32,6 @@
   <div class="panel">
     <h2>Write</h2>
     <div class="row">
-      <input id="ks" placeholder="keyspace" value="default" style="max-width:150px" />
       <input id="setKey" placeholder="key" />
       <input id="setVal" placeholder="value" />
       <input id="ttl" placeholder="ttl (s)" style="max-width:100px" />
@@ -63,8 +62,7 @@
 </main>
 <script>
 let apiKey=localStorage.getItem("falcon_key")||"";
-function ks(){return document.getElementById("ks").value.trim()||"default";}
-function hdrs(json){const h={};if(json)h["Content-Type"]="text/plain";if(apiKey)h["Authorization"]="Bearer "+apiKey;return h;}
+function hdrs(json){const h={};if(json)h["Content-Type"]="application/json";if(apiKey)h["Authorization"]="Bearer "+apiKey;return h;}
 async function refresh(){
   try{const h=await (await fetch("/health")).json();
     document.getElementById("nodeBadge").textContent=h.node_id+" · "+h.region+(h.replication_enabled?" · repl:"+(h.replication_role||"on"):"");
@@ -73,31 +71,31 @@ async function refresh(){
 async function putKey(){
   const key=document.getElementById("setKey").value.trim(); if(!key) return;
   const val=document.getElementById("setVal").value; const ttl=document.getElementById("ttl").value.trim();
-  let url=`/keyspaces/${ks()}/kv/${encodeURIComponent(key)}`; if(ttl)url+=`?ttl=${ttl}`;
+  const body=JSON.stringify(ttl?{key,value:val,ttl:Number(ttl)}:{key,value:val});
   const o=document.getElementById("setOut");
-  let res=await fetch(url,{method:"PUT",headers:hdrs(true),body:val});
+  let res=await fetch("/kv",{method:"POST",headers:hdrs(true),body});
   if(res.status===401){const k=prompt("API key:");if(k){apiKey=k;localStorage.setItem("falcon_key",k);return putKey();}}
-  if(res.ok){const b=await res.json();o.innerHTML=`<span class="ok">written</span> · seq ${b.sequence}`;}
+  if(res.ok){o.innerHTML=`<span class="ok">written</span>`;}
   else o.innerHTML=`<span class="err">error ${res.status}</span>`;
 }
 async function getKey(){
   const key=document.getElementById("getKey").value.trim(); if(!key) return scan();
   const o=document.getElementById("getOut");
-  let res=await fetch(`/keyspaces/${ks()}/kv/${encodeURIComponent(key)}`,{headers:hdrs()});
+  let res=await fetch(`/kv?key=${encodeURIComponent(key)}`,{headers:hdrs()});
   if(res.status===401){const k=prompt("API key:");if(k){apiKey=k;localStorage.setItem("falcon_key",k);return getKey();}}
   if(res.status===404){o.innerHTML=`<span class="err">not found</span>`;return;}
   if(res.ok){const b=await res.json();o.textContent=b.value;} else o.innerHTML=`<span class="err">error ${res.status}</span>`;
 }
 async function scan(){
   const p=document.getElementById("prefix").value.trim(); const o=document.getElementById("getOut");
-  let res=await fetch(`/keyspaces/${ks()}/kv?prefix=${encodeURIComponent(p)}`,{headers:hdrs()});
+  let res=await fetch(`/kv/scan?prefix=${encodeURIComponent(p)}`,{headers:hdrs()});
   if(res.status===401){const k=prompt("API key:");if(k){apiKey=k;localStorage.setItem("falcon_key",k);return scan();}}
   if(res.ok){const b=await res.json();const it=b.items||[];o.textContent=it.length?it.map(i=>`${i.key}\t${i.value}`).join("\n"):"(no keys)";}
   else o.innerHTML=`<span class="err">error ${res.status}</span>`;
 }
 async function delKey(){
   const key=document.getElementById("getKey").value.trim(); if(!key) return;
-  let res=await fetch(`/keyspaces/${ks()}/kv/${encodeURIComponent(key)}`,{method:"DELETE",headers:hdrs()});
+  let res=await fetch(`/kv?key=${encodeURIComponent(key)}`,{method:"DELETE",headers:hdrs()});
   if(res.status===401){const k=prompt("API key:");if(k){apiKey=k;localStorage.setItem("falcon_key",k);return delKey();}}
   document.getElementById("getOut").innerHTML=res.ok?`<span class="ok">deleted</span>`:`<span class="err">error ${res.status}</span>`;
 }
@@ -106,7 +104,7 @@ function subscribe(){
   const p=document.getElementById("subPrefix").value.trim();
   if(ws)ws.close();
   const proto=location.protocol==="https:"?"wss":"ws";
-  let url=`${proto}://${location.host}/subscribe?keyspace=${ks()}&`+(p?`prefix=${encodeURIComponent(p)}`:`prefix=`);
+  let url=`${proto}://${location.host}/subscribe?keyspace=default&`+(p?`prefix=${encodeURIComponent(p)}`:`prefix=`);
   if(apiKey)url+=`&api_key=${encodeURIComponent(apiKey)}`;
   ws=new WebSocket(url);
   const st=document.getElementById("subState");

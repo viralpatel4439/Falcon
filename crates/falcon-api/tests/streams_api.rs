@@ -1,6 +1,7 @@
-//! End-to-end tests for the Falcon Event Stream REST API: append routes by
-//! key to a stable partition, poll returns records after a group's committed
-//! offset, and commit advances that offset (at-least-once resume).
+//! End-to-end tests for the simplified Falcon Event Stream REST API:
+//! `POST /stream {key,value}` appends, `GET /stream` returns the next batch of
+//! records and advances the consumer position (auto-commit), so a second read
+//! returns nothing new. Partitions, groups, and offsets are internal.
 
 use falcon_core::{Config, Node};
 use serde_json::Value;
@@ -31,118 +32,80 @@ async fn start(config: Config) -> std::net::SocketAddr {
 }
 
 #[tokio::test]
-async fn append_poll_commit_lifecycle() {
+async fn append_then_read_next_batch_and_it_commits() {
     let dir = tempfile::tempdir().unwrap();
     let addr = start(config_with_stream(dir.path())).await;
     let client = reqwest::Client::new();
 
-    // Append 3 records under the same key -> same partition, ordered.
-    let mut partition = None;
+    // Append 3 records under the same key (kept in order on one partition).
     for i in 0..3 {
-        let resp: Value = client
-            .post(format!("http://{addr}/streams/events/records?key=user:1"))
-            .body(format!("evt{i}"))
+        let resp = client
+            .post(format!("http://{addr}/stream"))
+            .json(&serde_json::json!({"key":"user:1","value":format!("evt{i}")}))
             .send()
             .await
-            .unwrap()
-            .json()
-            .await
             .unwrap();
-        let p = resp["partition"].as_u64().unwrap();
-        assert_eq!(resp["offset"].as_u64().unwrap(), i + 1);
-        partition = Some(partition.unwrap_or(p));
-        assert_eq!(Some(p), partition, "same key must map to one partition");
+        assert!(resp.status().is_success());
     }
-    let p = partition.unwrap();
 
-    // Poll (group "g1") -> all 3 records, uncommitted.
-    let poll: Value = client
-        .get(format!("http://{addr}/streams/events/poll?group=g1&partition={p}"))
+    // First read returns all 3, in order.
+    let batch: Value = client
+        .get(format!("http://{addr}/stream"))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    let records = poll["records"].as_array().unwrap();
-    assert_eq!(records.len(), 3);
-    assert_eq!(records[0]["payload"], "evt0");
-    assert_eq!(records[2]["payload"], "evt2");
+    let items = batch["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3, "first read should return all appended records");
+    assert_eq!(items[0]["value"], "evt0");
+    assert_eq!(items[2]["value"], "evt2");
 
-    // Commit through offset 2.
-    let commit: Value = client
-        .post(format!(
-            "http://{addr}/streams/events/commit?group=g1&partition={p}&offset=2"
-        ))
+    // Second read returns nothing new (the first read committed progress).
+    let batch2: Value = client
+        .get(format!("http://{addr}/stream"))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(commit["committed"].as_u64().unwrap(), 2);
-
-    // Re-poll g1 -> only the record after the commit remains.
-    let poll2: Value = client
-        .get(format!("http://{addr}/streams/events/poll?group=g1&partition={p}"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let rec2 = poll2["records"].as_array().unwrap();
-    assert_eq!(rec2.len(), 1);
-    assert_eq!(rec2[0]["payload"], "evt2");
-
-    // A different group sees the full stream (independent cursor).
-    let poll_g2: Value = client
-        .get(format!("http://{addr}/streams/events/poll?group=g2&partition={p}"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(poll_g2["records"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        batch2["items"].as_array().unwrap().len(),
+        0,
+        "records should not be redelivered after a read commits them"
+    );
 }
 
 #[tokio::test]
-async fn stream_info_and_unknown_stream() {
+async fn stream_route_absent_without_the_product() {
+    // A node with no stream configured must not expose /stream.
     let dir = tempfile::tempdir().unwrap();
-    let addr = start(config_with_stream(dir.path())).await;
-    let client = reqwest::Client::new();
+    let mut config = Config::default();
+    config.storage.data_dir = dir.path().to_string_lossy().to_string();
+    let node = Arc::new(Node::build(config).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Only KV active — no Stream feature.
+    let mut features = falcon_core::FeatureSet::new();
+    features.insert(falcon_core::Feature::Kv);
+    let app = falcon_api::router_for(node, features, "/tmp/falcon-test-profile.toml".into());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
-    let info: Value = client
-        .get(format!("http://{addr}/streams/events"))
+    let resp = client_get(&format!("http://{addr}/stream")).await;
+    assert_eq!(resp, 404);
+}
+
+async fn client_get(url: &str) -> u16 {
+    reqwest::Client::new()
+        .get(url)
         .send()
         .await
         .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(info["partitions"].as_u64().unwrap(), 4);
-
-    // Unknown stream -> 404.
-    let resp = client
-        .get(format!("http://{addr}/streams/nope"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
-}
-
-#[tokio::test]
-async fn poll_requires_group_and_partition() {
-    let dir = tempfile::tempdir().unwrap();
-    let addr = start(config_with_stream(dir.path())).await;
-    let client = reqwest::Client::new();
-
-    // Missing ?group= and ?partition= -> 400.
-    let resp = client
-        .get(format!("http://{addr}/streams/events/poll"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
+        .status()
+        .as_u16()
 }

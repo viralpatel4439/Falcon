@@ -33,8 +33,7 @@
   <div class="panel">
     <h2>Push a job</h2>
     <div class="row">
-      <input id="queue" placeholder="queue (e.g. jobs)" style="max-width:220px" />
-      <input id="payload" placeholder="job payload" />
+      <input id="payload" placeholder="job value" />
       <button onclick="push()">Push</button>
     </div>
     <div class="out" id="pushOut" style="margin-top:12px"></div>
@@ -42,8 +41,6 @@
   <div class="panel">
     <h2>Pop a job</h2>
     <div class="row">
-      <input id="popQueue" placeholder="queue" style="max-width:220px" />
-      <input id="group" placeholder="consumer group" value="ui" style="max-width:180px" />
       <button onclick="pop()">Pop (auto-ack)</button>
     </div>
     <div class="out" id="popOut" style="margin-top:12px"></div>
@@ -51,7 +48,7 @@
 </main>
 <script>
 let apiKey = localStorage.getItem("falcon_key") || "";
-function hdrs(json){const h={};if(json)h["Content-Type"]="text/plain";if(apiKey)h["Authorization"]="Bearer "+apiKey;return h;}
+function hdrs(json){const h={};if(json)h["Content-Type"]="application/json";if(apiKey)h["Authorization"]="Bearer "+apiKey;return h;}
 async function refresh(){
   try{const h=await (await fetch("/health")).json();
     document.getElementById("nodeBadge").textContent=h.node_id+" · "+h.region+(h.replication_enabled?" · repl":"");
@@ -59,19 +56,17 @@ async function refresh(){
   }catch(e){document.getElementById("nodeBadge").textContent="offline";}
 }
 async function push(){
-  const q=document.getElementById("queue").value.trim(); if(!q) return;
   const p=document.getElementById("payload").value; const o=document.getElementById("pushOut");
-  let res=await fetch(`/queues/${encodeURIComponent(q)}/push`,{method:"POST",headers:hdrs(true),body:p});
+  let res=await fetch("/queue",{method:"POST",headers:hdrs(true),body:JSON.stringify({value:p})});
   if(res.status===401){const k=prompt("API key:");if(k){apiKey=k;localStorage.setItem("falcon_key",k);return push();}}
   o.innerHTML = res.ok ? `<span class="ok">pushed</span>` : `<span class="err">error ${res.status}</span>`;
 }
 async function pop(){
-  const q=document.getElementById("popQueue").value.trim(); if(!q) return;
-  const g=document.getElementById("group").value.trim()||"ui"; const o=document.getElementById("popOut");
-  let res=await fetch(`/queues/${encodeURIComponent(q)}/pop?group=${encodeURIComponent(g)}`,{method:"POST",headers:hdrs()});
+  const o=document.getElementById("popOut");
+  let res=await fetch("/queue",{headers:hdrs()});
   if(res.status===401){const k=prompt("API key:");if(k){apiKey=k;localStorage.setItem("falcon_key",k);return pop();}}
   if(res.status===204){o.innerHTML=`<span>(queue empty)</span>`;return;}
-  if(res.ok){const b=await res.json();o.innerHTML=`<span class="ok">popped</span>\n${b.payload??""}`;}
+  if(res.ok){const b=await res.json();o.innerHTML=`<span class="ok">popped</span>\n${b.value??""}`;}
   else o.innerHTML=`<span class="err">error ${res.status}</span>`;
 }
 refresh(); setInterval(refresh,5000);

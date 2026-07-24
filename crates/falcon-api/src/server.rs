@@ -1,4 +1,4 @@
-use crate::rest::{config as config_api, handlers, messaging, streams};
+use crate::rest::{config as config_api, handlers, simple};
 use crate::state::AppState;
 use axum::routing::post;
 use crate::ws;
@@ -44,46 +44,52 @@ pub fn router_for(node: Arc<Node>, features: FeatureSet, profile_path: PathBuf) 
         .route("/health", get(handlers::health))
         .route("/config", get(config_api::get_config).post(config_api::set_config));
 
-    // Key-value + realtime routes: present for the Cache and KV products.
+    // Realtime subscription (WebSocket) is available whenever a KV/cache
+    // product is present.
     if features.contains(Feature::Cache) || features.contains(Feature::Kv) {
+        app = app.route("/subscribe", get(ws::handler::ws_handler));
+    }
+
+    // Falcon Cache — POST /cache {key,value,ttl?} · GET/DELETE /cache?key=
+    // No scan: a cache is exact-key lookup by design. Entries expire and are
+    // evicted, so enumerating a cache returns a racy, partial snapshot and walks
+    // the very keyspace the tiering exists to avoid. Listing is a store's job — see /kv/scan.
+    if features.contains(Feature::Cache) {
+        app = app.route(
+            "/cache",
+            get(simple::cache_read)
+                .post(simple::cache_write)
+                .delete(simple::cache_delete),
+        );
+    }
+
+    // Falcon KV Store — POST /kv {key,value} · GET/DELETE /kv?key=
+    if features.contains(Feature::Kv) {
         app = app
-            .route("/subscribe", get(ws::handler::ws_handler))
-            .route("/kv", get(handlers::scan_default))
             .route(
-                "/kv/{key}",
-                get(handlers::get_key_default)
-                    .put(handlers::put_key_default)
-                    .delete(handlers::delete_key_default),
+                "/kv",
+                get(simple::kv_read_h)
+                    .post(simple::kv_write_h)
+                    .delete(simple::kv_delete_h),
             )
-            .route("/keyspaces/{keyspace}/kv", get(handlers::scan_keyspace))
-            .route(
-                "/keyspaces/{keyspace}/kv/{key}",
-                get(handlers::get_key_keyspace)
-                    .put(handlers::put_key_keyspace)
-                    .delete(handlers::delete_key_keyspace),
-            );
+            .route("/kv/scan", get(simple::kv_scan_h));
     }
 
-    // Falcon Event Stream.
+    // Falcon Event Stream — POST /stream {key,value} · GET /stream (next batch)
     if features.contains(Feature::Stream) {
-        app = app
-            .route("/streams/{stream}", get(streams::info))
-            .route("/streams/{stream}/records", post(streams::append))
-            .route("/streams/{stream}/poll", get(streams::poll))
-            .route("/streams/{stream}/commit", post(streams::commit));
+        app = app.route("/stream", get(simple::stream_next).post(simple::stream_append));
     }
 
-    // Falcon Pub/Sub.
+    // Falcon Pub/Sub — POST /pubsub {value}
     if features.contains(Feature::Pubsub) {
-        app = app.route("/topics/{topic}/publish", post(messaging::publish));
+        app = app.route("/pubsub", post(simple::pubsub_publish));
     }
 
-    // Falcon Queue.
+    // Falcon Queue — POST /queue {value} · GET /queue (dequeue) · POST /queue/ack {id}
     if features.contains(Feature::Queue) {
         app = app
-            .route("/queues/{queue}/push", post(messaging::push))
-            .route("/queues/{queue}/pop", post(messaging::pop))
-            .route("/queues/{queue}/ack", post(messaging::ack));
+            .route("/queue", get(simple::queue_pop).post(simple::queue_push))
+            .route("/queue/ack", post(simple::queue_ack));
     }
 
     // Anti-OOM: cap request body size so a single huge PUT can't exhaust

@@ -38,10 +38,10 @@ async fn metrics_reflect_operations() {
     let client = reqwest::Client::new();
 
     // Do some work.
-    client.put(format!("http://{addr}/kv/a")).body("1").send().await.unwrap();
-    client.put(format!("http://{addr}/kv/b")).body("2").send().await.unwrap();
-    client.get(format!("http://{addr}/kv/a")).send().await.unwrap();
-    client.get(format!("http://{addr}/kv/missing")).send().await.unwrap();
+    client.post(format!("http://{addr}/kv")).json(&serde_json::json!({"key":"a","value":"1"})).send().await.unwrap();
+    client.post(format!("http://{addr}/kv")).json(&serde_json::json!({"key":"b","value":"2"})).send().await.unwrap();
+    client.get(format!("http://{addr}/kv?key=a")).send().await.unwrap();
+    client.get(format!("http://{addr}/kv?key=missing")).send().await.unwrap();
 
     let body = client
         .get(format!("http://{addr}/metrics"))
@@ -89,8 +89,8 @@ async fn body_limit_rejects_oversized_put() {
 
     // Under the limit: OK.
     let ok = client
-        .put(format!("http://{addr}/kv/small"))
-        .body(vec![b'x'; 512])
+        .post(format!("http://{addr}/kv"))
+        .json(&serde_json::json!({"key":"small","value":"x".repeat(512)}))
         .send()
         .await
         .unwrap();
@@ -98,8 +98,8 @@ async fn body_limit_rejects_oversized_put() {
 
     // Over the limit: 413 Payload Too Large.
     let too_big = client
-        .put(format!("http://{addr}/kv/big"))
-        .body(vec![b'x'; 4096])
+        .post(format!("http://{addr}/kv"))
+        .json(&serde_json::json!({"key":"big","value":"x".repeat(4096)}))
         .send()
         .await
         .unwrap();
@@ -126,7 +126,7 @@ async fn metrics_and_readyz_bypass_auth() {
     );
     // A real KV route still requires auth.
     assert_eq!(
-        client.get(format!("http://{addr}/kv/x")).send().await.unwrap().status(),
+        client.get(format!("http://{addr}/kv?key=x")).send().await.unwrap().status(),
         401
     );
 }

@@ -91,7 +91,6 @@
     <div class="card">
       <h2>Falcon KV Store — Key/Value</h2>
       <div class="controls" style="margin-top:10px">
-        <select id="kv-keyspace" title="keyspace"></select>
         <input id="kv-prefix" placeholder="prefix filter (e.g. user:)" />
         <button class="ghost" onclick="scan()">Scan</button>
       </div>
@@ -115,7 +114,6 @@
       <h3 style="margin-top:16px">Event Streams</h3>
       <table><tbody id="streams"><tr><td class="empty">none configured</td></tr></tbody></table>
       <div class="controls" style="margin-top:14px">
-        <input id="pub-topic" placeholder="topic" />
         <input id="pub-msg" placeholder="message" />
         <button onclick="publish()">Publish</button>
       </div>
@@ -131,7 +129,7 @@
   </div>
 
   <div class="muted" style="text-align:center;font-size:12px">
-    Auto-refreshes every 2s · REST API at <code>/kv</code>, <code>/topics</code>, <code>/queues</code>, <code>/streams</code> · Prometheus at <code>/metrics</code>
+    Auto-refreshes every 2s · REST API at <code>/kv</code>, <code>/cache</code>, <code>/pubsub</code>, <code>/queue</code>, <code>/stream</code> · Prometheus at <code>/metrics</code>
   </div>
 </main>
 
@@ -204,13 +202,10 @@ async function refresh() {
     compHtml += `<div class="card" style="text-align:center"><h3>Replication</h3><span class="pill ${comp&&hz.replication_enabled?'on':'off'}">${hz.replication_enabled?(hz.replication_role||'on'):'off'}</span></div>`;
     $('#components').innerHTML = compHtml;
 
-    // keyspaces
+    // keyspaces (internal storage view)
     $('#keyspaces').innerHTML = (hz.keyspaces||[]).map(k=>
       `<tr><td>${k.name}</td><td><code>${k.tier}</code></td><td>${k.subscriptions_enabled?'✔':'—'}</td><td>${k.last_applied_sequence}</td><td>${k.ttl_tracked_keys}</td></tr>`).join('');
-    // keyspace selector
-    const sel = $('#kv-keyspace'); const cur = sel.value;
-    sel.innerHTML = (hz.keyspaces||[]).map(k=>`<option>${k.name}</option>`).join('');
-    if (cur) sel.value = cur;
+    pickKvRoot(hz);
 
     // messaging lists
     fillList('#topics', hz.topics, 'no topics');
@@ -225,29 +220,30 @@ function fillList(sel, names, empty) {
   el.innerHTML = names.map(n=>`<tr><td>${n}</td></tr>`).join('');
 }
 
+// Which KV-ish product this node runs: prefer /kv, fall back to /cache.
+let kvRoot = '/kv';
+function pickKvRoot(hz){ const p=(hz.products||[]); kvRoot = p.includes('kv') ? '/kv' : (p.includes('cache') ? '/cache' : '/kv'); }
+const JSONH = { 'Content-Type': 'application/json' };
+
 async function scan() {
-  const ks = $('#kv-keyspace').value || 'default';
   const prefix = encodeURIComponent($('#kv-prefix').value||'');
-  const r = await api(`/keyspaces/${ks}/kv?prefix=${prefix}`); const b = await r.json();
+  const r = await api(`${kvRoot}/scan?prefix=${prefix}`); const b = await r.json();
   const rows = (b.items||[]);
   $('#kv-rows').innerHTML = rows.length ? rows.map(it=>
     `<tr><td>${esc(it.key)}</td><td class="val">${esc(it.value)}</td><td><button class="mini" onclick="delKey('${esc(it.key)}')">✕</button></td></tr>`).join('')
     : `<tr><td colspan="3" class="empty">no keys${$('#kv-prefix').value?` for prefix "${esc($('#kv-prefix').value)}"`:''}</td></tr>`;
 }
 async function putKey() {
-  const ks = $('#kv-keyspace').value || 'default';
   const key = $('#kv-key').value; if (!key) return toast('key required');
-  await api(`/keyspaces/${ks}/kv/${encodeURIComponent(key)}`, { method:'PUT', body: $('#kv-value').value });
+  await api(kvRoot, { method:'POST', headers: JSONH, body: JSON.stringify({ key, value: $('#kv-value').value }) });
   toast('put ' + key); $('#kv-key').value=''; $('#kv-value').value=''; scan();
 }
 async function delKey(key) {
-  const ks = $('#kv-keyspace').value || 'default';
-  await api(`/keyspaces/${ks}/kv/${encodeURIComponent(key)}`, { method:'DELETE' });
+  await api(`${kvRoot}?key=${encodeURIComponent(key)}`, { method:'DELETE' });
   toast('deleted ' + key); scan();
 }
 async function publish() {
-  const t = $('#pub-topic').value; if (!t) return toast('topic required');
-  const r = await api(`/topics/${encodeURIComponent(t)}/publish`, { method:'POST', body: $('#pub-msg').value });
+  const r = await api('/pubsub', { method:'POST', headers: JSONH, body: JSON.stringify({ value: $('#pub-msg').value }) });
   if (r.ok) { toast('published'); $('#pub-msg').value=''; } else toast('publish failed ('+r.status+')');
 }
 function esc(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }

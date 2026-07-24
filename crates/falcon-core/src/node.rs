@@ -5,7 +5,7 @@ use falcon_messaging::{Messaging, QueueSpec, StreamSpec, TopicMode, TopicSpec};
 use falcon_metrics::Metrics;
 use falcon_storage::{HotEngine, StorageEngine, StorageError, WarmEngine};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,8 +74,11 @@ impl Node {
                 interval_fsync_ms: s.interval_fsync_ms,
             })
             .collect();
+        // Messaging lays its three products out in their own subdirectories
+        // (`pubsub/`, `queue/`, `stream/`) under this base, so pass `data_dir`
+        // directly rather than a shared `messaging/` folder.
         let messaging = Arc::new(Messaging::build(
-            data_dir.join("messaging"),
+            data_dir.to_path_buf(),
             &topic_specs,
             &queue_specs,
             &stream_specs,
@@ -249,15 +252,42 @@ pub async fn shutdown_signal() {
     }
 }
 
+/// The directory a keyspace's on-disk files live in. When the keyspace declares
+/// a `storage_subdir` (products always do — `cache/`, `kv/`, …), its files are
+/// isolated under `data_dir/<subdir>/` so co-located products never share a
+/// directory. An empty subdir keeps the legacy flat layout (files directly under
+/// `data_dir`). The directory is created if missing.
+fn keyspace_dir(ks_cfg: &KeyspaceConfig, data_dir: &Path) -> Result<PathBuf, NodeError> {
+    let dir = if ks_cfg.storage_subdir.is_empty() {
+        data_dir.to_path_buf()
+    } else {
+        data_dir.join(&ks_cfg.storage_subdir)
+    };
+    std::fs::create_dir_all(&dir).map_err(StorageError::from)?;
+    Ok(dir)
+}
+
+/// Back-compat: if `new` doesn't exist yet but a `legacy` file/dir from the old
+/// flat layout does, move it into place so an existing deployment keeps its data
+/// when it upgrades to per-product storage directories. Best-effort: a failed
+/// rename is ignored (the engine then simply starts empty at `new`).
+fn migrate_legacy(legacy: &Path, new: &Path) {
+    if !new.exists() && legacy.exists() {
+        let _ = std::fs::rename(legacy, new);
+    }
+}
+
 fn build_keyspace(
     ks_cfg: &KeyspaceConfig,
     config: &Config,
     data_dir: &Path,
 ) -> Result<Keyspace, NodeError> {
+    let ks_dir = keyspace_dir(ks_cfg, data_dir)?;
     let engine: Arc<dyn StorageEngine> = match ks_cfg.tier {
         TierName::Hot => Arc::new(HotEngine::new()),
         TierName::Warm => {
-            let path = data_dir.join(format!("{}.wal", ks_cfg.name));
+            let path = ks_dir.join(format!("{}.wal", ks_cfg.name));
+            migrate_legacy(&data_dir.join(format!("{}.wal", ks_cfg.name)), &path);
             let policy = if ks_cfg.interval_fsync_ms > 0 {
                 falcon_storage::FsyncPolicy::IntervalMs(ks_cfg.interval_fsync_ms)
             } else {
@@ -267,12 +297,14 @@ fn build_keyspace(
         }
         #[cfg(feature = "cold")]
         TierName::Cold => {
-            let path = data_dir.join(format!("{}_cold", ks_cfg.name));
+            let path = ks_dir.join(format!("{}_cold", ks_cfg.name));
+            migrate_legacy(&data_dir.join(format!("{}_cold", ks_cfg.name)), &path);
             Arc::new(falcon_storage::ColdEngine::open(&path)?)
         }
         #[cfg(feature = "cold")]
         TierName::Tiered => {
-            let path = data_dir.join(format!("{}_tiered", ks_cfg.name));
+            let path = ks_dir.join(format!("{}_tiered", ks_cfg.name));
+            migrate_legacy(&data_dir.join(format!("{}_tiered", ks_cfg.name)), &path);
             let capacity_bytes = ks_cfg.hot_capacity_mb * 1024 * 1024;
             Arc::new(falcon_storage::TieredEngine::open(
                 &path,
@@ -294,7 +326,7 @@ fn build_keyspace(
             } else {
                 falcon_storage::FlushPolicy::Sync
             };
-            build_sharded_engine(ks_cfg, config, data_dir, policy)?
+            build_sharded_engine(ks_cfg, config, &ks_dir, data_dir, policy)?
         }
     };
 
@@ -327,13 +359,15 @@ fn build_keyspace(
 fn build_sharded_engine(
     ks_cfg: &KeyspaceConfig,
     config: &Config,
+    ks_dir: &Path,
     data_dir: &Path,
     policy: falcon_storage::FlushPolicy,
 ) -> Result<Arc<dyn StorageEngine>, NodeError> {
     use crate::config::StorageBackend;
     match &config.storage.backend {
         StorageBackend::Local => {
-            let path = data_dir.join(format!("{}_shards", ks_cfg.name));
+            let path = ks_dir.join(format!("{}_shards", ks_cfg.name));
+            migrate_legacy(&data_dir.join(format!("{}_shards", ks_cfg.name)), &path);
             Ok(falcon_storage::ShardedObjectStore::open_local(
                 &path,
                 ks_cfg.shard_buckets,

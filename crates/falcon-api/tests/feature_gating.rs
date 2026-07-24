@@ -36,18 +36,18 @@ async fn cache_node_serves_kv_but_gates_messaging() {
     let addr = start(features, profile).await;
     let client = reqwest::Client::new();
 
-    // KV routes are present.
+    // Cache route is present.
     let put = client
-        .put(format!("http://{addr}/keyspaces/cache/kv/k"))
-        .body("v")
+        .post(format!("http://{addr}/cache"))
+        .json(&serde_json::json!({"key":"k","value":"v"}))
         .send()
         .await
         .unwrap();
-    assert!(put.status().is_success(), "cache node should accept KV writes");
+    assert!(put.status().is_success(), "cache node should accept cache writes");
 
-    // Messaging routes are not mounted -> 404.
-    for path in ["/topics/t/publish", "/queues/q/push", "/streams/s/records"] {
-        let resp = client.post(format!("http://{addr}{path}")).body("x").send().await.unwrap();
+    // Other products' routes are not mounted -> 404.
+    for path in ["/pubsub", "/queue", "/stream"] {
+        let resp = client.post(format!("http://{addr}{path}")).json(&serde_json::json!({"value":"x"})).send().await.unwrap();
         assert_eq!(resp.status(), 404, "cache node must not expose {path}");
     }
 
@@ -66,19 +66,19 @@ async fn pubsub_node_gates_kv_and_streams() {
 
     // Pub/Sub route present.
     let pub_resp = client
-        .post(format!("http://{addr}/topics/events/publish"))
-        .body("hello")
+        .post(format!("http://{addr}/pubsub"))
+        .json(&serde_json::json!({"value":"hello"}))
         .send()
         .await
         .unwrap();
     assert!(pub_resp.status().is_success(), "pubsub node should accept publishes");
 
     // KV + stream routes are gated off.
-    let kv = client.get(format!("http://{addr}/kv/k")).send().await.unwrap();
+    let kv = client.get(format!("http://{addr}/kv?key=k")).send().await.unwrap();
     assert_eq!(kv.status(), 404, "pubsub node must not expose KV");
     let stream = client
-        .post(format!("http://{addr}/streams/s/records"))
-        .body("x")
+        .post(format!("http://{addr}/stream"))
+        .json(&serde_json::json!({"value":"x"}))
         .send()
         .await
         .unwrap();

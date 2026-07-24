@@ -38,8 +38,8 @@ async fn subscribe_receives_put_update() {
 
     let client = reqwest::Client::new();
     client
-        .put(format!("http://{addr}/kv/foo"))
-        .body("bar")
+        .post(format!("http://{addr}/kv"))
+        .json(&serde_json::json!({"key":"foo","value":"bar"}))
         .send()
         .await
         .unwrap();
@@ -80,15 +80,15 @@ async fn crud_still_works_when_subscriptions_disabled() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .put(format!("http://{addr}/kv/foo"))
-        .body("bar")
+        .post(format!("http://{addr}/kv"))
+        .json(&serde_json::json!({"key":"foo","value":"bar"}))
         .send()
         .await
         .unwrap();
     assert!(resp.status().is_success());
 
     let resp = client
-        .get(format!("http://{addr}/kv/foo"))
+        .get(format!("http://{addr}/kv?key=foo"))
         .send()
         .await
         .unwrap();
