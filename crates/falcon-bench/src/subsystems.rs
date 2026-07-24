@@ -238,6 +238,18 @@ pub async fn bench_pubsub(messages: usize) -> Result<SubResult> {
     // Concurrent peak (group commit): many producers publishing at once.
     let peak = peak_append(&wire, "bench", messages.max(4000), 32, AppendKind::Publish).await?;
 
+    // Latency phase: publish ONE message at a time and time each round-trip.
+    // The reply only returns after the durable topic has appended+fsynced the
+    // message, so this is the honest per-publish latency (not fire-and-forget).
+    let lat_n = messages.min(500);
+    let mut lat = Vec::with_capacity(lat_n);
+    for i in 0..lat_n {
+        let payload = vec![format!("lat{i}").into_bytes()];
+        let t = Instant::now();
+        pubc.pipeline_publish("bench", &payload).await?;
+        lat.push(t.elapsed().as_micros() as u64);
+    }
+
     // DURABLE + RELIABLE: reopen and replay the durable log from offset 1;
     // every message must be present, in order.
     drop(handle);
@@ -259,7 +271,7 @@ pub async fn bench_pubsub(messages: usize) -> Result<SubResult> {
         bail!("pub/sub durability check failed: topic not present after restart");
     };
 
-    let (p50, p99, max) = (0, 0, 0); // per-message latency not meaningful for fire-and-forget publish
+    let (p50, p99, max) = percentiles(lat);
     Ok(SubResult {
         name: "Falcon Pub/Sub (durable topic)".into(),
         ops: messages as u64,
@@ -389,6 +401,19 @@ pub async fn bench_stream(records: usize) -> Result<SubResult> {
     // on one disk each partition fsyncs independently, so fewer = faster.
     let peak = peak_append(&wire, "perf1", records.max(4000), 32, AppendKind::StreamAppend).await?;
 
+    // Latency phase: append ONE record at a time to the isolated `perf1` stream
+    // and time each round-trip. The reply returns only after the durable
+    // partition log has appended+fsynced, so this is the honest per-append
+    // latency. Uses `perf1` so it never pollutes the `events` correctness count.
+    let lat_n = records.min(500);
+    let mut lat = Vec::with_capacity(lat_n);
+    for i in 0..lat_n {
+        let payload = vec![format!("lat{i}").into_bytes()];
+        let t = Instant::now();
+        client.pipeline_stream_append("perf1", b"k", &payload).await?;
+        lat.push(t.elapsed().as_micros() as u64);
+    }
+
     // RELIABLE: offsets are strictly increasing on a single partition.
     let partition = all_offsets[0].0;
     let mut prev = 0u64;
@@ -437,8 +462,7 @@ pub async fn bench_stream(records: usize) -> Result<SubResult> {
     }
     let durable = format!("resumed after commit: 0 of {records} redelivered, exactly as committed");
 
-    // Latency isn't per-record here (batched append); report append batch cost.
-    let (p50, p99, max) = (0, 0, 0);
+    let (p50, p99, max) = percentiles(lat);
     Ok(SubResult {
         name: "Falcon Event Stream (partitioned)".into(),
         ops: records as u64,

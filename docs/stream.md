@@ -150,13 +150,16 @@ cargo build --release -p falcon-cli -p falcon-bench
 falcon-bench --bench-all           # Event Stream row below
 ```
 
-| Product | Concurrent peak | Correctness verified |
-|---------|----------------:|----------------------|
-| **Falcon Event Stream** | ~4,340 ops/sec | per-key ordered; resumes at committed offset |
+| Product | Concurrent peak | Per-op latency (sequential, durable append) | Correctness verified |
+|---------|----------------:|---------------------------------------------|----------------------|
+| **Falcon Event Stream** | ~4,280 ops/sec | p50 3.8 ms · p99 4.1 ms | per-key ordered; resumes at committed offset |
 
-Throughput scales with partition count: each partition orders independently, and
-the shared group-commit writer coalesces fsyncs across them (raise
-`interval_fsync_ms` to trade a bounded loss window for still higher throughput).
+The per-op latency is one durable append at a time — each fsyncs the partition
+log before returning (~4 ms, like a durable KV write). Throughput scales with
+partition count and concurrency: each partition orders independently, and the
+shared group-commit writer coalesces fsyncs across them (raise `interval_fsync_ms`
+to trade a bounded loss window for still higher throughput), which is why the
+concurrent peak is ~4,280/sec, far above `1 / 4 ms`.
 
 ## 8. Guarantees
 - **Per-key total order** within a partition.

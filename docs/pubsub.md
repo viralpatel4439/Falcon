@@ -127,13 +127,17 @@ cargo build --release -p falcon-cli -p falcon-bench
 falcon-bench --bench-all           # Pub/Sub row below
 ```
 
-| Product | Concurrent peak | Correctness verified |
-|---------|----------------:|----------------------|
-| **Falcon Pub/Sub** | **~4,550 ops/sec** | ordered; persisted across restart |
+| Product | Concurrent peak | Per-op latency (sequential, durable publish) | Correctness verified |
+|---------|----------------:|----------------------------------------------|----------------------|
+| **Falcon Pub/Sub** | **~4,550 ops/sec** | p50 4.0 ms · p99 4.1 ms | ordered; persisted across restart |
 
 Pub/Sub is the highest-throughput product in `--bench-all`: fan-out over the
 in-memory `broadcast` channel has no per-subscriber disk cost, and durable topics
-append through the same group-commit writer the other products use.
+append through the same group-commit writer the other products use. The per-op
+latency is measured on a **durable** topic — each single publish fsyncs the log
+before returning, so it tracks the write path (~4 ms); an ephemeral topic (no
+disk) is far faster. Under concurrency, group commit batches those fsyncs, which
+is why the peak is ~4,550/sec rather than `1 / 4 ms`.
 
 ## 8. Guarantees
 - **Ephemeral:** at-most-once fan-out to whoever is connected at publish time.

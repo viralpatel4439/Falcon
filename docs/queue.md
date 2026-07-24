@@ -139,10 +139,12 @@ falcon-bench --bench-all           # Queue row below
 
 | Product | Concurrent peak | Per-op latency (sequential, durable) | Correctness verified |
 |---------|----------------:|--------------------------------------|----------------------|
-| **Falcon Queue** | ~4,270 ops/sec | p50 154 µs · p99 416 µs | 2000/2000 delivered; acked jobs not redelivered |
+| **Falcon Queue** | ~4,280 ops/sec | p50 149 µs · p99 405 µs | 2000/2000 delivered; acked jobs not redelivered |
 
-Pop/ack latency is sub-millisecond because delivery is pure in-memory cursor
-bookkeeping — only `push` touches the disk (one group-commit WAL append).
+Pop/ack latency is sub-millisecond (the only product here that is) because
+delivery is pure in-memory cursor bookkeeping — only `push` touches the disk
+(one group-commit WAL append), whereas Pub/Sub and Stream fsync a durable log on
+every op.
 
 ## 8. Guarantees
 - **At-least-once** with ack + redelivery-on-timeout.

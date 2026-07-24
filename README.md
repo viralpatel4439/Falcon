@@ -535,11 +535,17 @@ Each row also passed its correctness checks.
 | Product | Concurrent peak | Per-op latency (sequential, durable) | Correctness verified |
 |---------|----------------:|--------------------------------------|----------------------|
 | **Falcon KV Store** | ~2,120 ops/sec | p50 3.9 ms · p99 4.1 ms | 2000/2000 survived a hard restart |
-| **Falcon Pub/Sub** | **~4,550 ops/sec** | — | ordered; persisted across restart |
-| **Falcon Queue** | ~4,270 ops/sec | p50 154 µs · p99 416 µs | 2000/2000 delivered; acked jobs not redelivered |
-| **Falcon Event Stream** | ~4,340 ops/sec | — | per-key ordered; resumes at committed offset |
+| **Falcon Pub/Sub** | **~4,550 ops/sec** | p50 4.0 ms · p99 4.1 ms¹ | ordered; persisted across restart |
+| **Falcon Queue** | ~4,280 ops/sec | p50 149 µs · p99 405 µs² | 2000/2000 delivered; acked jobs not redelivered |
+| **Falcon Event Stream** | ~4,280 ops/sec | p50 3.8 ms · p99 4.1 ms¹ | per-key ordered; resumes at committed offset |
 | **Falcon KV Store (real-time)** | ~2,310 ops/sec | p50 4.0 ms · p99 4.3 ms | 640/640 writes notified (32 subs), no drops/dupes |
 | **Multi-region** (leader→follower, 16 writers) | ~930 ops/sec | — | 320/320 converged, none lost; batch converged in ~1.0 s |
+
+¹ *Pub/Sub and Stream latency is per durable publish/append — each op fsyncs a
+durable log, so it tracks the write path (~4 ms, like a durable KV write).* ²
+*Queue latency is per pop+ack, which is in-memory cursor bookkeeping (sub-ms);
+only `push` touches the disk.* All three are the sequential (one-op-at-a-time)
+latency; the concurrent-peak column is the group-committed throughput.
 
 *Multi-region throughput reflects cross-region convergence over async gRPC, not
 per-write latency; both nodes persist independently.*
